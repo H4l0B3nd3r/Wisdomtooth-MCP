@@ -70,8 +70,7 @@ GUI-launched editor hands to its MCP servers.
       "command": ["wisdomtooth-mcp"],
       "environment": {
         "ADVISOR_BACKEND": "claude-code",
-        "ADVISOR_MINIMAL_TOOLS": "1",
-        "ADVISOR_ANSWER_BUDGET": "500"
+        "ADVISOR_PRESET": "small"
       },
       "enabled": true,
       "timeout": 300000
@@ -95,8 +94,16 @@ Verify with **`advisor_status`**. You want `active backend: claude-code` and
 
 ## Settings that matter for local models
 
-The two settings in the config above exist because the consumer is a small
-model, and they are the difference between this tool helping and hurting.
+`ADVISOR_PRESET` in the config above sets the length and tool-surface levers
+together, sized by your model's context window:
+
+| Preset | For | Answer ceiling | Tool surface |
+|---|---|---|---|
+| `small` | up to ~32k context (7B–30B local models) | 600 words | minimal |
+| `medium` (default) | ~32k–200k (large local and most hosted models) | 2,000 words | full |
+| `large` | 200k+ (Claude Code, Codex and similar) | 64,000 words | full |
+
+Anything you set explicitly still wins. The sections below explain each lever.
 
 ### `ADVISOR_MINIMAL_TOOLS=1` — shrink the tool surface
 
@@ -119,17 +126,15 @@ measurably improves tool-selection accuracy in small models.
 
 Claude's answer lands **inside your local model's context**. An unbounded Opus
 answer can be larger than an 8B model's entire window. This sets a ceiling in
-words (default 64000, generous enough for a full design plan) and is enforced
-through the system prompt, which is the only lever that works on the
-subscription backend — the Claude Code CLI has no `max_tokens` flag. Claude is
-told it is a ceiling, not a target, and to size each answer to the question.
-**The default is sized for a large-context caller — set one of the smaller
-values below for a local model.**
+words (from the preset: 600 / 2,000 / 64,000) and is enforced through the
+system prompt, which is the only lever that works on the subscription backend
+— the Claude Code CLI has no `max_tokens` flag. Claude is told it is a
+ceiling, not a target, and to size each answer to the question.
 
 - `300` — tight contexts, quick factual escalations
-- `600` — ordinary advice on a small local model
-- `1200` — architecture discussions on a mid-size model
-- `64000` — default; frontier callers with large windows
+- `600` — the `small` preset; ordinary advice on a small local model
+- `2000` — the `medium` default; room for a real design answer
+- `64000` — the `large` preset; frontier callers with large windows
 - `0` — no limit
 
 `max_tokens` also exists but is **API-backend only**; on the subscription
@@ -218,6 +223,39 @@ something you can click instead.
 If your agent buries the answer, ask it for the `[saved: ...]` path — the tool
 result tells it to hand that over.
 
+### Watching usage
+
+The footer's `[usage: ...]` line shows what each consult used. For totals, call
+`advisor_usage`: consults, tokens and API-rate cost for the last hour, 5 hours,
+24 hours and 7 days, plus a per-model breakdown. The raw records are in
+`~/.wisdomtooth/usage.jsonl`.
+
+To stop an over-eager agent before it drains your plan, set a cap in the
+server's `environment`:
+
+```jsonc
+"ADVISOR_MAX_CONSULTS_PER_5H": "10",
+"ADVISOR_MAX_CONSULTS_PER_WEEK": "60"
+```
+
+A capped consult is refused before anything is sent. Word-for-word repeats
+within 30 minutes are answered from the saved copy and never count.
+
+### Letting the server read files
+
+Your agent can pass `context_files: ["src/app.py", "src/db.py"]` instead of
+pasting code, which keeps those characters out of its own window. The server
+reads only inside `ADVISOR_FILE_ROOTS` (or its working directory, if that is a
+project folder rather than your home folder) and refuses `.env`, key files,
+`.ssh/` and `.git/`. If `advisor_status` shows no file roots, set
+`ADVISOR_FILE_ROOTS` to the project path.
+
+### Follow-up questions
+
+Pass the file name from a previous `[saved: ...]` line as `follow_up_of`, and
+the advisor sees its earlier question and answer again — useful when the first
+answer raised a question of its own.
+
 ---
 
 ## When something goes wrong
@@ -233,6 +271,9 @@ method, stored token, and whether anything is hijacking billing.
 | AUTH FAILURE mid-session | Logged out or token revoked | `advisor_login` — a human must complete OAuth; retrying never helps |
 | "usage limit is exhausted" | Plan's headless quota spent | Wait for reset, or add an API key and use `ADVISOR_BACKEND=auto` |
 | Consult times out | Not logged in, or a first-run prompt is blocking | Run `claude` interactively once, then `advisor_auth_check` |
+| "Consult cap reached" | A cap you set in `ADVISOR_MAX_CONSULTS_PER_*` | Wait for the time given, or raise the cap |
+| "context_files is unavailable" | The server runs from your home folder | Set `ADVISOR_FILE_ROOTS` to the project path |
+| The same answer again, marked `[repeat: ...]` | The agent re-asked word for word | Expected — add new context to get a new answer |
 | Answers overflow the agent's context | Budget too high | Lower `ADVISOR_ANSWER_BUDGET` |
 | Can't find what Claude actually said | The agent summarised it | Open the newest file in `~/.wisdomtooth/consults` (`advisor_status` prints the path) |
 | Agent escalates constantly | Rules file not installed | Copy `.kilocode/rules/wisdomtooth.md` into the project |

@@ -1,5 +1,46 @@
 # AGENT-UPDATE.md — Migration playbook
 
+## 0.9.0 — usage ledger, server-read files, follow-ups, presets
+
+**Nothing to change for an existing config.** New behaviour, all server-side:
+
+- **Usage ledger and caps.** Every consult is logged to
+  `~/.wisdomtooth/usage.jsonl` (tokens, API-rate cost, duration), summarised
+  by the new `advisor_usage` tool and a line in `advisor_status`; the answer
+  footer gains a `[usage: ...]` line. Optional caps:
+  `ADVISOR_MAX_CONSULTS_PER_HOUR` / `_5H` / `_WEEK`, `ADVISOR_MAX_USD_PER_DAY`.
+  `ADVISOR_USAGE_LOG=0` turns the ledger off.
+- **Repeat guard.** An identical consult within `ADVISOR_REPEAT_WINDOW`
+  minutes (30) returns the saved answer for free.
+- **`context_files`** on `ask_wisdomtooth` and `review_code`: the server reads
+  the files itself, inside `ADVISOR_FILE_ROOTS` or its working directory.
+- **`follow_up_of`** on `ask_wisdomtooth`: continue a saved consult by file name.
+- **Caller presets.** `ADVISOR_PRESET=small|medium|large` sets answer budget
+  and tool surface together. The default is `medium` (a 2,000-word ceiling),
+  replacing 0.8.1's 64,000, which is now the `large` preset. A config that sets
+  `ADVISOR_ANSWER_BUDGET` explicitly keeps its value.
+- **Profanity scrubbing is off by default.** `ADVISOR_NSFW_SCRUB=1` turns it
+  back on; the shipped rules file no longer tells agents to scrub.
+- **Fixes:** each consult gets its own system-prompt file (concurrent consults
+  shared one); a consult the client cancels now kills the `claude` process
+  instead of letting it run on (on the API backend it closes the stream);
+  `max_context_chars` and `nsfw_scrub` honour the config file; a follow-up of
+  a large consult keeps the earlier answer instead of losing it to truncation;
+  a failed `claude --help` probe is retried rather than cached;
+  `advisor_login` and `advisor_auth_check` send progress heartbeats, so they
+  survive a client's silence timeout like consults do; tokens from failed
+  consults count in usage totals and the dollar cap; sub-cent costs show as
+  `≈$0.0034`, not `≈$0.00`; the consult tools no longer claim `deep` is the
+  default model.
+- **Backend registry**, the seam for non-Claude providers — see README →
+  Adding a provider.
+- **License:** Apache-2.0.
+
+`advisor_usage` is hidden in minimal mode like the other operator tools;
+`advisor_status` carries the summary line.
+
+---
+
 ## 0.8.1 — large consults no longer die at 180s
 
 **Nothing to change in the client config. Reinstall and restart the server entry.**

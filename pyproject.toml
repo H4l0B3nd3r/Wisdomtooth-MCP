@@ -1,18 +1,27 @@
 [project]
 name = "wisdomtooth-mcp"
-version = "0.8.1"
+version = "0.9.0"
 description = "MCP server that lets coding agents escalate to a frontier model for advice when stuck (Claude by default)"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
+keywords = ["mcp", "model-context-protocol", "claude", "coding-agent", "local-llm", "kilo-code"]
 # Pins reflect the APIs this server actually uses:
 #   anthropic>=0.72  -> output_config.effort, thinking={"type":"adaptive"}
 #   mcp>=1.12        -> FastMCP tool(title=..., annotations=ToolAnnotations(...))
 dependencies = ["mcp>=1.12", "anthropic>=0.72"]
 
+[project.urls]
+Repository = "https://github.com/H4l0B3nd3r/Wisdomtooth-MCP"
+Issues = "https://github.com/H4l0B3nd3r/Wisdomtooth-MCP/issues"
+
 [project.scripts]
 wisdomtooth-mcp = "wisdomtooth.server:main"
 
 [build-system]
-requires = ["hatchling"]
+# 1.27 is the first hatchling that reads PEP 639 `license` / `license-files`.
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]

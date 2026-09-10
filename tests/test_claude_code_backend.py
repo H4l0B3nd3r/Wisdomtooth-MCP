@@ -330,8 +330,8 @@ def test_system_prompt_travels_as_a_file(server, fake_claude):
     consult(srv)
     path = fake_claude.flag_value("--system-prompt-file")
     assert path
-    with open(path, encoding="utf-8") as fh:
-        assert "expert technical advisor" in fh.read()
+    assert "expert technical advisor" in fake_claude.last["system_prompt"]
+    assert not os.path.exists(path)  # removed once the CLI exited
 
 
 def test_flags_after_the_system_prompt_survive(server, fake_claude):

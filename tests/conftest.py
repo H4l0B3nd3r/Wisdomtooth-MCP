@@ -43,7 +43,7 @@ ADVISOR_ENV = tuple(sorted(set(_srv.CONFIG_KEYS.values()) | {
 # real CLI. ADVISOR_CONSULT_DIR is pinned to a temp directory by the autouse
 # `consult_dir` fixture below, and wiping it would scatter transcripts through
 # the developer's real ~/.wisdomtooth.
-_PRESERVED = {"ADVISOR_CLAUDE_BIN", "ADVISOR_CONSULT_DIR"}
+_PRESERVED = {"ADVISOR_CLAUDE_BIN", "ADVISOR_CONSULT_DIR", "ADVISOR_USAGE_FILE"}
 
 
 def _reload(env: dict) -> object:
@@ -66,6 +66,14 @@ def consult_dir(tmp_path, monkeypatch):
     """
     path = tmp_path / "consults"
     monkeypatch.setenv("ADVISOR_CONSULT_DIR", str(path))
+    return path
+
+
+@pytest.fixture(autouse=True)
+def usage_file(tmp_path, monkeypatch):
+    """Keep the usage ledger out of the developer's home, like transcripts."""
+    path = tmp_path / "usage.jsonl"
+    monkeypatch.setenv("ADVISOR_USAGE_FILE", str(path))
     return path
 
 
@@ -126,11 +134,25 @@ Commands:
 argv = sys.argv[1:]
 
 
+def system_prompt():
+    """The prompt file's content, read while it still exists: the server
+    deletes each consult's prompt file once the CLI exits."""
+    if "--system-prompt-file" not in argv:
+        return None
+    try:
+        with open(argv[argv.index("--system-prompt-file") + 1],
+                  encoding="utf-8") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
 def log(prompt=""):
     """Record every invocation -- prompt runs, --help probes and auth checks."""
     record = {
         "argv": argv,
         "prompt": prompt,
+        "system_prompt": system_prompt(),
         "cwd": os.getcwd(),
         # Only the variables the billing tests care about; a full env dump
         # would make the recording file enormous.
@@ -197,7 +219,14 @@ else:
         "type": "result", "subtype": "success", "is_error": False,
         "result": "FAKE ANSWER for model=" + model,
         "total_cost_usd": 0.01,
-        "modelUsage": {"claude-test-" + model: {"costUSD": 0.01}},
+        "duration_ms": 1500,
+        "usage": {"input_tokens": 1200, "output_tokens": 340,
+                  "cache_read_input_tokens": 0,
+                  "cache_creation_input_tokens": 0},
+        "modelUsage": {"claude-test-" + model: {
+            "inputTokens": 1200, "outputTokens": 340,
+            "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0,
+            "costUSD": 0.01}},
     }))
     sys.exit(0)
 '''

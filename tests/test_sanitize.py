@@ -68,24 +68,28 @@ SAFE_TOKENS = [
 
 @pytest.mark.parametrize("text", SAFE_TOKENS)
 def test_scrubber_leaves_ordinary_code_and_prose_alone(server, text):
-    assert server()._scrub_nsfw(text) == text
+    assert server(ADVISOR_NSFW_SCRUB="1")._scrub_nsfw(text) == text
 
 
 def test_scrubbing_is_case_preserving(server):
-    srv = server()
+    srv = server(ADVISOR_NSFW_SCRUB="1")
     assert srv._scrub_nsfw("Damn").istitle()
     assert srv._scrub_nsfw("DAMN").isupper()
 
 
-def test_scrubbing_can_be_disabled(server):
-    srv = server(ADVISOR_NSFW_SCRUB="0")
-    assert srv._scrub_nsfw("damn") == "damn"
+def test_scrubbing_is_off_by_default(server):
+    """It rewrites the user's own text, so it is theirs to switch on."""
+    assert server()._scrub_nsfw("damn") == "damn"
+
+
+def test_scrubbing_can_be_enabled(server):
+    assert server(ADVISOR_NSFW_SCRUB="1")._scrub_nsfw("damn") == "darn"
 
 
 def test_extra_wordlist_is_loaded(server, tmp_path):
     path = tmp_path / "extra.json"
     path.write_text(json.dumps({"frobnicate": "adjust"}), encoding="utf-8")
-    srv = server(ADVISOR_NSFW_EXTRA_JSON=str(path))
+    srv = server(ADVISOR_NSFW_EXTRA_JSON=str(path), ADVISOR_NSFW_SCRUB="1")
     assert srv._scrub_nsfw("frobnicate the widget") == "adjust the widget"
 
 
@@ -102,7 +106,7 @@ def test_code_under_review_is_never_word_scrubbed(server, fake_claude):
     Substituting words inside it makes the advisor comment on code that does
     not exist, and any string-literal fix it suggests will not apply.
     """
-    srv = server(ADVISOR_BACKEND="claude-code")
+    srv = server(ADVISOR_BACKEND="claude-code", ADVISOR_NSFW_SCRUB="1")
     code = 'raise RuntimeError("damn, the shard is unreachable")'
     srv._consult(question="review", context=code, scrub_context=False)
     assert "damn" in fake_claude.last["prompt"]

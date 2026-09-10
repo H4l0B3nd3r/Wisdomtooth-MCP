@@ -36,15 +36,16 @@ troubleshooting. This file is the reference.
 
 | Tool | Purpose |
 |---|---|
-| `ask_wisdomtooth(question, context, attempts_so_far, [model, effort, max_tokens])` | Stuck on implementation or framework/platform/OS behavior after docs + attempts failed |
-| `review_code(code, concern, [model, effort, max_tokens])` | Residual doubt about subtle or security-sensitive code just written |
+| `ask_wisdomtooth(question, context, attempts_so_far, [model, effort, max_tokens, context_files, follow_up_of])` | Stuck on implementation or framework/platform/OS behavior after docs + attempts failed. `context_files` has the server read files itself; `follow_up_of` continues a saved consult |
+| `review_code(code, concern, [model, effort, max_tokens, context_files])` | Residual doubt about subtle or security-sensitive code just written |
 | `compare_approaches(problem, options, criteria, [model, effort, max_tokens])` | 2+ viable approaches, tradeoffs unclear after your own analysis |
 | `advisor_login(force, wait_seconds)` | Free. **Connects the user's Claude subscription over OAuth** — opens the sign-in on their desktop, waits, and switches billing over with no restart |
 | `advisor_set_token(token)` | Free. Headless alternative: stores a `claude setup-token` credential privately and applies it immediately |
 | `advisor_logout()` | Free. Forgets the stored subscription token |
 | `advisor_models()` | Free. Lists tiers, per-model effort support, token ceiling |
-| `advisor_configure(model, effort, max_tokens, reset)` | Free. Changes defaults for this server process — no restart needed |
-| `advisor_status()` | Free. Active backend, billing target, current defaults |
+| `advisor_configure(model, effort, max_tokens, answer_budget, reset)` | Free. Changes defaults for this server process — no restart needed |
+| `advisor_status()` | Free. Active backend, billing target, current defaults, a one-line usage summary |
+| `advisor_usage(days)` | Free. Consults, tokens and API-rate cost for the last 1 h / 5 h / 24 h / 7 d and per model, plus caps |
 | `advisor_auth_check()` | Free. Login/credential diagnosis when a consult fails |
 
 ## Install
@@ -170,6 +171,41 @@ is no "open this panel" call, and `notifications/message` only moves the
 problem into the client's log pane. A file is the one channel that outlives
 the chat window.
 
+## Usage, spend and caps
+
+Every consult is logged to `~/.wisdomtooth/usage.jsonl` with its tokens, how
+long it took and what it would cost at API rates, and the answer footer shows
+the same figures:
+
+```
+[usage: 14,210 tokens in · 2,130 out · 48s · ≈$0.12 at API rates]
+```
+
+`advisor_usage` totals the last hour, 5 hours, 24 hours and 7 days (the windows
+Claude plans meter) and breaks the week down by model; `advisor_status` carries
+a one-line version. Subscription consults are not billed per token, so the
+dollar figure is a proxy for how much of the plan's allowance a consult used.
+The plan's own meter is not visible to an MCP server.
+
+Optional caps stop an agent that escalates too often before it drains the plan:
+`ADVISOR_MAX_CONSULTS_PER_HOUR`, `_PER_5H`, `_PER_WEEK` and
+`ADVISOR_MAX_USD_PER_DAY`. A capped consult is refused before anything is
+sent, and the error says when the next slot opens. An identical consult inside
+`ADVISOR_REPEAT_WINDOW` minutes (default 30) returns the saved answer instead
+of paying twice.
+
+## Files and follow-ups
+
+`context_files` lets the agent pass paths instead of pasting file contents, so
+a 40k-character file never passes through a small model's own context window.
+The server reads only inside `ADVISOR_FILE_ROOTS`, or its working directory
+when that is not your home folder or a drive root. It refuses credential-shaped
+files (`.env`, keys, anything under `.ssh/` or `.git/`), skips binaries, and
+redacts secrets exactly as it does for pasted context.
+
+`follow_up_of` continues an earlier consult: pass the file name from its
+`[saved: ...]` line and the advisor sees its earlier question and answer again.
+
 ## Configuration
 
 Five layers, highest priority first:
@@ -184,15 +220,23 @@ Five layers, highest priority first:
 
 | Env var | Config key | Default | Meaning |
 |---|---|---|---|
-| `ADVISOR_BACKEND` | `backend` | `auto` | `auto` / `claude-code` / `api` |
+| `ADVISOR_PRESET` | `preset` | `medium` | Caller preset by context window: `small` (≤32k — 600-word answers, minimal tools), `medium` (2,000 words), `large` (200k+ — 64,000 words). Explicit settings override it |
+| `ADVISOR_BACKEND` | `backend` | `auto` | `auto` / `claude-code` / `api`, or a registered provider |
 | `ADVISOR_MODEL` | `model` | `balanced` | Tier alias or full model ID |
 | `ADVISOR_EFFORT` | `effort` | (API default) | `low`/`medium`/`high`/`xhigh`/`max` |
-| `ADVISOR_ANSWER_BUDGET` | `answer_budget` | `64000` | Ceiling on answer length in words, presented to Claude as a ceiling, not a target. Works on **both** backends; `0` disables. The only length control the subscription backend has. Set a few hundred for small-context callers |
-| `ADVISOR_MINIMAL_TOOLS` | `minimal_tools` | `0` | `1` advertises only `ask_wisdomtooth` + `advisor_status`, cutting per-turn tool context from ~3340 to ~1090 tokens |
+| `ADVISOR_ANSWER_BUDGET` | `answer_budget` | preset (`2000`) | Ceiling on answer length in words, presented to Claude as a ceiling, not a target. Works on **both** backends; `0` disables. The only length control the subscription backend has |
+| `ADVISOR_MINIMAL_TOOLS` | `minimal_tools` | preset (`0`) | `1` advertises only `ask_wisdomtooth` + `advisor_status`, cutting per-turn tool context from ~3340 to ~1090 tokens |
 | `ADVISOR_MAX_TOKENS` | `max_tokens` | `64000` | Answer cap, **API backend only** (the CLI has no such flag), max 128000 |
 | `ADVISOR_SAVE_CONSULTS` | `save_consults` | `1` | Write every answer to a Markdown file the user can open. `0` disables |
 | `ADVISOR_CONSULT_DIR` | `consult_dir` | `~/.wisdomtooth/consults` | Where those files go |
 | `ADVISOR_CONSULT_KEEP` | `consult_keep` | `200` | Keep the newest N transcripts; `0` keeps everything |
+| `ADVISOR_USAGE_LOG` | `usage_log` | `1` | Log every consult's tokens, cost and duration to the usage ledger. `0` disables |
+| `ADVISOR_USAGE_FILE` | `usage_file` | `~/.wisdomtooth/usage.jsonl` | Where the ledger goes (entries older than 35 days are dropped) |
+| `ADVISOR_MAX_CONSULTS_PER_HOUR` / `_PER_5H` / `_PER_WEEK` | `max_consults_per_hour` / `_5h` / `_week` | `0` | Refuse consults past this many in the window. `0` = no cap |
+| `ADVISOR_MAX_USD_PER_DAY` | `max_usd_per_day` | `0` | Refuse consults once the last 24 h reach this API-rate cost. `0` = no cap |
+| `ADVISOR_REPEAT_WINDOW` | `repeat_window` | `30` | Minutes during which an identical consult returns the saved answer for free. `0` disables |
+| `ADVISOR_FILE_ROOTS` | `file_roots` | (working dir) | Folders `context_files` may read, separated by `;` on Windows and `:` elsewhere. Without it, the working directory — unless that is the home folder or a drive root |
+| `ADVISOR_SHOW_SUPPORT` | `show_support` | `1` | `0` hides the donation line in the startup banner and transcripts |
 | `ADVISOR_TIMEOUT` | `timeout` | `300` | Base seconds before a consult is killed; each consult adds ~10s per 1k chars sent and ~0.06s per answer-budget word, ×1.5/2/2.5 at effort high/xhigh/max |
 | `ADVISOR_TIMEOUT_MAX` | `timeout_max` | `3600` | Upper bound on that sized timeout |
 | `ADVISOR_TIMEOUT_SCALE` | `timeout_scale` | `1` | Multiplier on the size-based extra time; `0` = flat `ADVISOR_TIMEOUT` |
@@ -205,7 +249,7 @@ Five layers, highest priority first:
 | `ADVISOR_MAX_BUDGET_USD` | `max_budget_usd` | — | Hard spend cap per consult (CLI backend) |
 | `ADVISOR_FALLBACK_TO_API` | `fallback_to_api` | `1` | Allow the quota-exhausted fallback in `auto` |
 | `ADVISOR_MAX_CONTEXT_CHARS` | `max_context_chars` | `60000` | Truncation cap for `context` |
-| `ADVISOR_NSFW_SCRUB` | `nsfw_scrub` | `1` | `0` disables outbound word scrubbing |
+| `ADVISOR_NSFW_SCRUB` | `nsfw_scrub` | `0` | `1` replaces profanity in outbound text with mild substitutes |
 | `ADVISOR_CLAUDE_BIN` | `claude_bin` | (PATH) | Absolute path to `claude` |
 | `ADVISOR_TRANSPORT` | `transport` | `stdio` | `stdio` or `http` |
 | `ADVISOR_HOST` / `ADVISOR_PORT` | `host` / `port` | `127.0.0.1` / `8484` | HTTP transport bind |
@@ -250,7 +294,7 @@ request instead of erroring.
 
 ```bash
 uv venv && uv pip install -e . pytest pytest-asyncio anyio
-.venv/Scripts/python -m pytest        # 196 tests, no credentials, no spend
+.venv/Scripts/python -m pytest        # no credentials, no spend
 ```
 
 The suite covers request shaping against the current Messages API, the CLI
@@ -284,3 +328,22 @@ model/effort tier, and received a usable in-budget answer.
   leaving the annotation off behaves identically on both SDK majors.
 - If you want the advisor to have its own tools (web search, file access), wrap
   Claude Code instead: `claude mcp serve`.
+
+## Adding a provider
+
+Launch ships Claude only, through the `claude-code` and `api` backends. Each is
+a `Backend` in `wisdomtooth/server.py`: a name for `ADVISOR_BACKEND`, the
+account it bills, a readiness check, and one
+`consult(system, user_content, model, effort, max_tokens) -> str` function. A
+ChatGPT or Kimi backend registers the same way with `register_backend(...)`,
+reports its tokens through `_note_usage(...)` so the ledger, caps and repeat
+guard cover it, and takes full model IDs (the `fast`/`balanced`/`deep` tiers
+name Claude models).
+
+## Support the project
+
+Wisdomtooth is free and open source under the Apache-2.0 license (see
+`LICENSE`). Donation links will be listed here and on the repository's Sponsor
+button once they exist. They appear only where a person reads — this README,
+the startup banner and saved transcripts — never in anything sent to your
+agent, and `ADVISOR_SHOW_SUPPORT=0` hides them.

@@ -3,6 +3,41 @@
 Ordered roughly by how likely they are to bite. "Fixed in code" items are
 handled automatically; the rest need awareness or config.
 
+## Fixed in code (0.9.0) — know they exist, don't re-break them
+
+0000. **One system-prompt file per consult, deleted afterwards.** A shared
+   `system-prompt.txt` was rewritten by every concurrent consult — a parallel
+   `review_code`, or another client's server process — so the CLI could read
+   another consult's prompt or a half-written one. `_system_prompt_file` makes
+   a fresh file under `~/.wisdomtooth/prompts/`; the CLI backend removes it.
+0000a. **Cancellation and usage ride on context variables.** `asyncio.to_thread`
+   copies the caller's `contextvars` into the worker thread; that is how
+   `_Cancellation` reaches `_run_claude` and how backends report tokens via
+   `_note_usage` without changing their signatures. `loop.run_in_executor`
+   does NOT copy context — swapping it in silently breaks both.
+0000b. **Accounting never costs the answer.** `_append_usage` and the ledger
+   readers swallow I/O errors and skip torn lines. Caps read the shared ledger,
+   so they count every server process on the machine; with
+   `ADVISOR_USAGE_LOG=0` they only see the current process.
+0000c. **The repeat guard is per process and keyed on everything sent** —
+   backend, model, effort, max_tokens, system prompt and full content, files
+   included. A changed file is a new consult, not a repeat.
+0000d. **`context_files` refuses the home folder as a root.** Without
+   `ADVISOR_FILE_ROOTS`, a server started from `~` or a drive root reads
+   nothing rather than exposing the whole profile. Kilo starts local MCP
+   servers in the session's project directory (`cwd` in the entry overrides
+   it), so the default root is the project there.
+0000e. **A follow-up's earlier exchange gets at most half the context cap.**
+   Unbounded, a large earlier consult filled the cap and `_truncate`'s middle
+   cut removed the earlier answer — the one thing a follow-up needs.
+0000f. **`_cli_features` caches only a probe that found flags.** A timed-out
+   `--help` used to pin the process to a bare command line (no JSON, no usage,
+   no `--tools ""`) until restart.
+0000g. **Every slow tool runs through `_with_heartbeat`**, not bare
+   `asyncio.to_thread`: `advisor_login` waits up to 180s and
+   `advisor_auth_check` runs two 30s probes, and a client aborts a silent
+   call at its own timeout, which may be shorter than either.
+
 ## Fixed in code (0.8.0) — know they exist, don't re-break them
 
 000. **`~/.wisdomtooth` and `~/.claude-advisor` must never both exist.**
@@ -102,13 +137,13 @@ handled automatically; the rest need awareness or config.
    `ADVISOR_MAX_CONTEXT_CHARS`) with head+tail retention and a visible
    truncation marker. Whole-repo pastes get expensive fast on the API
    backend and drain the headless pool on subscription.
-6. **NSFW content pass-through.** All outbound content (question + context)
-   is scrubbed of NSFW words with case-preserving SFW replacements,
+6. **NSFW word scrubbing (opt-in since 0.9.0).** With `ADVISOR_NSFW_SCRUB=1`,
+   outbound content (question + context) is scrubbed of NSFW words with
+   case-preserving SFW replacements,
    word-boundary only — so `class`, `assert`, `cocktail`, `shell` are never
    mangled, but standalone profanity in logs/commit messages/history is
    replaced. Extend the wordlist with `ADVISOR_NSFW_EXTRA_JSON` (path to a
-   `{"word":"replacement"}` file); disable with `ADVISOR_NSFW_SCRUB=0`.
-   The agent is also ruled to scrub at the source before calling. Caveat:
+   `{"word":"replacement"}` file). Caveat:
    if the advisor's answer quotes your (scrubbed) input, a find-and-replace
    suggestion may reference the SFW substitute — sanity-check string-literal
    edits it proposes against the real file.
@@ -218,8 +253,8 @@ handled automatically; the rest need awareness or config.
 
 15b. **The answer lands in the caller's context.** An unbounded Opus reply can
     be bigger than a small model's whole window. `ADVISOR_ANSWER_BUDGET`
-    (default 64000 words — set a few hundred for a small model) is the
-    control, and it works on BOTH backends because
+    (set by `ADVISOR_PRESET`: 600 words for `small`, 2,000 for the default
+    `medium`) is the control, and it works on BOTH backends because
     it goes through the system prompt. `ADVISOR_MAX_TOKENS` does NOT help on
     the subscription backend — the CLI has no such flag, and the answer footer
     says so when you pass one.

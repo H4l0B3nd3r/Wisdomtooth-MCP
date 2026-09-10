@@ -21,6 +21,8 @@ Run:
 """
 
 import asyncio
+import contextvars
+import hashlib
 import json
 import os
 import pathlib
@@ -28,8 +30,11 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import time
-from typing import Optional
+from dataclasses import dataclass
+from typing import Callable, Optional
 
 import anthropic
 from anthropic import Anthropic
@@ -77,7 +82,7 @@ try:
     from importlib.metadata import version as _pkg_version
     __version__ = _pkg_version("wisdomtooth-mcp")
 except Exception:  # running from source without install
-    __version__ = "0.4.0-dev"
+    __version__ = "0.0.0+source"
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +119,7 @@ DEFAULT_CONFIG_PATH = os.path.join(_state_dir(), "config.json")
 
 # Config-file key -> the environment variable that overrides it.
 CONFIG_KEYS = {
+    "preset": "ADVISOR_PRESET",
     "backend": "ADVISOR_BACKEND",
     "model": "ADVISOR_MODEL",
     "effort": "ADVISOR_EFFORT",
@@ -140,6 +146,15 @@ CONFIG_KEYS = {
     "save_consults": "ADVISOR_SAVE_CONSULTS",
     "consult_dir": "ADVISOR_CONSULT_DIR",
     "consult_keep": "ADVISOR_CONSULT_KEEP",
+    "usage_log": "ADVISOR_USAGE_LOG",
+    "usage_file": "ADVISOR_USAGE_FILE",
+    "max_consults_per_hour": "ADVISOR_MAX_CONSULTS_PER_HOUR",
+    "max_consults_per_5h": "ADVISOR_MAX_CONSULTS_PER_5H",
+    "max_consults_per_week": "ADVISOR_MAX_CONSULTS_PER_WEEK",
+    "max_usd_per_day": "ADVISOR_MAX_USD_PER_DAY",
+    "repeat_window": "ADVISOR_REPEAT_WINDOW",
+    "file_roots": "ADVISOR_FILE_ROOTS",
+    "show_support": "ADVISOR_SHOW_SUPPORT",
 }
 
 
@@ -165,13 +180,19 @@ def _load_config_file() -> dict:
 _FILE_CONFIG = _load_config_file()
 
 
+_PRESET_VALUES: dict = {}  # filled once ADVISOR_PRESET is resolved, below
+
+
 def _setting(key: str, default=None):
-    """Environment first, then the config file, then the built-in default."""
+    """Environment first, then the config file, then the caller preset, then
+    the built-in default."""
     env_value = os.environ.get(CONFIG_KEYS[key])
     if env_value not in (None, ""):
         return env_value
     if key in _FILE_CONFIG and _FILE_CONFIG[key] is not None:
         return _FILE_CONFIG[key]
+    if key in _PRESET_VALUES:
+        return _PRESET_VALUES[key]
     return default
 
 
@@ -180,6 +201,26 @@ def _flag(key: str, default: bool) -> bool:
     if value is None:
         return default
     return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+# Caller presets: one setting instead of several, sized by the CALLING model's
+# context window, because the advisor's answer lands in that window. Anything
+# set explicitly (env or config file) still wins over the preset.
+#   small  -- up to ~32k context: 7B-30B local models
+#   medium -- ~32k-200k: large local models and most hosted models (default)
+#   large  -- 200k+: Claude Code, Codex and similar frontier callers
+PRESETS = {
+    "small": {"answer_budget": 600, "minimal_tools": True},
+    "medium": {"answer_budget": 2000, "minimal_tools": False},
+    "large": {"answer_budget": 64000, "minimal_tools": False},
+}
+DEFAULT_PRESET = "medium"
+PRESET = str(_setting("preset", DEFAULT_PRESET)).strip().lower()
+if PRESET not in PRESETS:
+    print(f"[wisdomtooth] unknown ADVISOR_PRESET {PRESET!r}; using "
+          f"{DEFAULT_PRESET!r}. Valid: {', '.join(PRESETS)}", file=sys.stderr)
+    PRESET = DEFAULT_PRESET
+_PRESET_VALUES.update(PRESETS[PRESET])
 
 
 # Backend -- WHO GETS BILLED
@@ -224,14 +265,13 @@ FALLBACK_TO_API = _flag("fallback_to_api", True)
 # Optional hard spend cap handed to the CLI (`--max-budget-usd`).
 MAX_BUDGET_USD = _setting("max_budget_usd")
 
-# The ceiling on an answer's length, in words. The default is generous so a
-# genuine design or migration plan fits in one answer; the prompt presents it as
-# a ceiling, not a target, because every word lands in the CALLING model's
-# context and is billed against the user's plan limits. `max_tokens` cannot help
-# on the subscription backend (the CLI exposes no such flag), so the budget is
-# expressed in the system prompt, which both backends honour. A small local
-# caller (8k-32k context) should set a few hundred words. 0 removes it.
-ANSWER_BUDGET = max(0, int(_setting("answer_budget", 64000)))
+# The ceiling on an answer's length, in words, normally set through the caller
+# preset above. The prompt presents it as a ceiling, not a target, because
+# every word lands in the CALLING model's context and is billed against the
+# user's plan limits. `max_tokens` cannot help on the subscription backend (the
+# CLI exposes no such flag), so the budget is expressed in the system prompt,
+# which both backends honour. 0 removes it.
+ANSWER_BUDGET = max(0, int(_setting("answer_budget", 2000)))
 
 # Expose only the tools an agent actually needs (`ask_wisdomtooth`, `advisor_status`)
 # and hide the operator tools. Every schema is charged against the calling
@@ -249,6 +289,32 @@ SAVE_CONSULTS = _flag("save_consults", True)
 # Keep the newest N transcripts, so an advisor in daily use does not grow a
 # directory forever. 0 keeps everything.
 CONSULT_KEEP = max(0, int(_setting("consult_keep", 200)))
+
+# The usage ledger: one JSON line per consult -- tokens, API-equivalent cost,
+# duration -- so the user can see what the advisor spends against their plan's
+# 5-hour and weekly limits, and so the caps below have something to count.
+# Shared by every server process on the machine.
+USAGE_LOG = _flag("usage_log", True)
+
+# Optional hard caps, checked before a consult starts. 0 = no cap. Only
+# consults that reached the model count; repeats and refusals are free. The
+# dollar cap uses the API-rate estimate on both backends.
+MAX_CONSULTS_PER_HOUR = max(0, int(_setting("max_consults_per_hour", 0)))
+MAX_CONSULTS_PER_5H = max(0, int(_setting("max_consults_per_5h", 0)))
+MAX_CONSULTS_PER_WEEK = max(0, int(_setting("max_consults_per_week", 0)))
+MAX_USD_PER_DAY = max(0.0, float(_setting("max_usd_per_day", 0)))
+
+# Minutes during which an identical consult returns the earlier answer instead
+# of paying for it again. A looping agent re-asks word for word; the rules ask
+# it not to, and this makes it free when it does anyway. 0 disables.
+REPEAT_WINDOW_S = max(0.0, float(_setting("repeat_window", 30)) * 60)
+
+# Where donations go. Empty until the maintainer sets it, and nothing is shown
+# anywhere while it is empty. It appears only where a person reads -- the
+# startup banner on stderr and the saved transcripts -- never in a tool result,
+# which lands in the calling model's context and is the user's to spend.
+SUPPORT_URL = ""
+SHOW_SUPPORT = _flag("show_support", True)
 
 
 # ---------------------------------------------------------------------------
@@ -676,11 +742,11 @@ SECRET_PATTERNS = [
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"), "[REDACTED:private-key]"),
     (re.compile(r"(?i)\b(password|passwd|secret|token|api[_-]?key)\s*[=:]\s*[\'\"]?[^\s\'\"]{8,}"), "\\1=[REDACTED]"),
 ]
-MAX_CONTEXT_CHARS = int(os.environ.get("ADVISOR_MAX_CONTEXT_CHARS", "60000"))
+MAX_CONTEXT_CHARS = int(_setting("max_context_chars", 60000))
 
 # NSFW word scrubbing: word-boundary only (never mangles class/assert/shell/
-# cocktail), case-preserving, SFW replacements. Backstop to the agent-side
-# scrub mandated in .kilocode/rules. Disable: ADVISOR_NSFW_SCRUB=0.
+# cocktail), case-preserving, SFW replacements. Off by default -- it rewrites
+# the user's text, which should be their choice. Enable: ADVISOR_NSFW_SCRUB=1.
 # Extend: ADVISOR_NSFW_EXTRA_JSON=/path/to/{"word":"replacement"} file.
 # Note: `review_code` deliberately skips this -- see _consult(scrub_context=).
 NSFW_REPLACEMENTS = {
@@ -724,17 +790,18 @@ def _match_case(replacement: str, original: str) -> str:
 
 
 def _scrub_nsfw(text: str) -> str:
-    if _NSFW_RE is None or os.environ.get("ADVISOR_NSFW_SCRUB", "1") == "0":
+    if _NSFW_RE is None or not _flag("nsfw_scrub", False):
         return text
     return _NSFW_RE.sub(lambda m: _match_case(_NSFW_MAP[m.group(0).lower()],
                                               m.group(0)), text)
 
 
-def _truncate(text: str) -> str:
-    if len(text) <= MAX_CONTEXT_CHARS:
+def _truncate(text: str, limit: Optional[int] = None) -> str:
+    limit = MAX_CONTEXT_CHARS if limit is None else max(int(limit), 200)
+    if len(text) <= limit:
         return text
-    head = text[: int(MAX_CONTEXT_CHARS * 0.7)]
-    tail = text[-int(MAX_CONTEXT_CHARS * 0.25):]
+    head = text[: int(limit * 0.7)]
+    tail = text[-int(limit * 0.25):]
     dropped = len(text) - len(head) - len(tail)
     return (head + f"\n\n[...advisor-server truncated {dropped} chars; pass "
             "focused excerpts instead of whole files...]\n\n" + tail)
@@ -751,6 +818,167 @@ def _sanitize(text: str, scrub: bool = True) -> str:
     if scrub:
         text = _scrub_nsfw(text)
     return _truncate(text)
+
+
+# ---------------------------------------------------------------------------
+# Files the server reads itself
+# ---------------------------------------------------------------------------
+# A small caller that pastes a 40k-character file into `context` spends that
+# much of its own window before the advisor sees a byte. `context_files` lets
+# it pass paths instead. Reading stays inside allowed folders -- ADVISOR_FILE_ROOTS,
+# else the server's working directory unless that is the home folder or a drive
+# root -- and credential-shaped files are refused before they are opened.
+# Everything read still goes through `_sanitize`.
+
+_MAX_CONTEXT_FILES = 20
+# The server's own state directory (stored token, transcripts) is refused by
+# location in `_read_context_files`, not by name here.
+_DENY_DIRS = {".ssh", ".aws", ".azure", ".gnupg", ".kube", ".docker", ".git"}
+_DENY_FILE = re.compile(
+    r"^(\.env(\..+)?|\.netrc|\.npmrc|\.pypirc|\.git-credentials"
+    r"|id_(rsa|dsa|ecdsa|ed25519)(\.pub)?|credentials(\.json)?"
+    r"|.+\.(pem|key|p12|pfx|kdbx|jks|keystore))$", re.IGNORECASE)
+_SAFE_SUFFIXES = (".example", ".sample", ".template")
+
+
+def _too_broad(path: str) -> bool:
+    real = os.path.normcase(os.path.realpath(path))
+    home = os.path.normcase(os.path.realpath(os.path.expanduser("~")))
+    return real == home or os.path.dirname(real) == real
+
+
+def _file_roots() -> list:
+    raw = _setting("file_roots")
+    if raw:
+        items = raw if isinstance(raw, list) else str(raw).split(os.pathsep)
+    else:
+        cwd = os.getcwd()
+        items = [] if _too_broad(cwd) else [cwd]
+    return [os.path.realpath(os.path.expanduser(str(p).strip()))
+            for p in items if str(p).strip()]
+
+
+def _inside(path: str, root: str) -> bool:
+    try:
+        return (os.path.commonpath([os.path.normcase(path), os.path.normcase(root)])
+                == os.path.normcase(root))
+    except ValueError:  # different drives
+        return False
+
+
+def _refused(parts: list) -> bool:
+    if any(p.lower() in _DENY_DIRS for p in parts[:-1]):
+        return True
+    name = parts[-1]
+    return (not name.lower().endswith(_SAFE_SUFFIXES)
+            and _DENY_FILE.match(name) is not None)
+
+
+def _read_context_files(paths) -> str:
+    """Read the requested files into `<file>` blocks for the context."""
+    if isinstance(paths, str):
+        paths = [paths]
+    paths = [str(p).strip() for p in paths if str(p).strip()]
+    roots = _file_roots()
+    if not roots:
+        raise AdvisorInputError(
+            "context_files is unavailable: the server's working directory "
+            f"({os.getcwd()}) is the home folder or a drive root, which is too "
+            "broad to expose. Paste the relevant excerpts into `context` "
+            "instead, or ask the user to set ADVISOR_FILE_ROOTS to the project "
+            "folder.")
+    blocks, notes = [], []
+    for raw in paths[:_MAX_CONTEXT_FILES]:
+        candidate = raw if os.path.isabs(raw) else os.path.join(roots[0], raw)
+        real = os.path.realpath(candidate)
+        root = next((r for r in roots if _inside(real, r)), None)
+        if root is None:
+            notes.append(f"{raw}: refused, outside the allowed folders")
+            continue
+        rel = os.path.relpath(real, root)
+        if (_inside(real, os.path.realpath(_state_dir()))
+                or _refused(rel.replace("\\", "/").split("/"))):
+            notes.append(f"{raw}: refused, looks like a credential file")
+            continue
+        if not os.path.isfile(real):
+            notes.append(f"{raw}: not found")
+            continue
+        try:
+            with open(real, "rb") as fh:
+                data = fh.read(MAX_CONTEXT_CHARS * 4 + 1)
+        except OSError as exc:
+            notes.append(f"{raw}: unreadable ({exc.__class__.__name__})")
+            continue
+        if b"\0" in data[:8192]:
+            notes.append(f"{raw}: skipped, binary")
+            continue
+        blocks.append(f'<file path="{rel}">\n'
+                      + data.decode("utf-8", errors="replace") + "\n</file>")
+    if len(paths) > _MAX_CONTEXT_FILES:
+        notes.append(f"only the first {_MAX_CONTEXT_FILES} files were read")
+    if not blocks:
+        raise AdvisorInputError(
+            "None of context_files could be attached: "
+            + "; ".join(notes or ["no paths given"])
+            + ". Allowed folders: " + ", ".join(roots) + ".")
+    if notes:
+        blocks.append("<file_notes>\n" + "\n".join(notes) + "\n</file_notes>")
+    return "\n\n".join(blocks)
+
+
+# ---------------------------------------------------------------------------
+# Follow-ups
+# ---------------------------------------------------------------------------
+# Consults are stateless by design, so continuing one means re-sending it. The
+# transcript already holds exactly what was sent and what came back, so a
+# follow-up names that file and the server does the re-sending -- the caller
+# neither pastes the old exchange nor pays for it in its own context.
+
+_SENT_HEADING = "## Sent to Claude\n\n"
+_ANSWER_HEADING = "\n## Claude's answer\n\n"
+_SUPPORT_MARK = "\n---\n\n*Wisdomtooth is free and open source."
+_TRANSCRIPT_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _load_previous_consult(ref: str) -> str:
+    if not SAVE_CONSULTS:
+        raise AdvisorInputError(
+            "follow_up_of needs saved consults, and ADVISOR_SAVE_CONSULTS=0 is "
+            "set. Re-send the earlier question and answer in `context` instead.")
+    name = str(ref).strip().strip("`").replace("\\", "/").rsplit("/", 1)[-1]
+    if not name.endswith(CONSULT_SUFFIX):
+        name += CONSULT_SUFFIX
+    path = os.path.join(_consult_dir(), name)
+    text = None
+    if _TRANSCRIPT_NAME.match(name):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            text = None
+    if text is None:
+        raise AdvisorInputError(
+            f"no saved consult named {name!r} in {_consult_dir()}. Pass the file "
+            "name from an earlier answer's [saved: ...] line"
+            + (f"; only the newest {CONSULT_KEEP} are kept." if CONSULT_KEEP
+               else "."))
+    head, found, answer = text.rpartition(_ANSWER_HEADING)
+    if not found:
+        raise AdvisorInputError(f"{name} is not a Wisdomtooth transcript.")
+    sent = (head.partition(_SENT_HEADING)[2] or head).strip()
+    answer = answer.split(_SUPPORT_MARK, 1)[0].strip()
+    # At most half the context cap. Otherwise a large earlier consult fills
+    # the cap and `_sanitize`'s truncation cuts from the middle -- the earlier
+    # answer, which is what a follow-up is about. The earlier request gives
+    # way first.
+    budget = MAX_CONTEXT_CHARS // 2
+    if len(sent) + len(answer) > budget:
+        answer = _truncate(answer, int(budget * 0.6))
+        sent = _truncate(sent, budget - len(answer))
+    return ("<previous_consult>\n<earlier_request>\n" + sent
+            + "\n</earlier_request>\n<your_earlier_answer>\n" + answer
+            + "\n</your_earlier_answer>\n</previous_consult>\n"
+            "This consult follows up on the one above.")
 
 
 # ---------------------------------------------------------------------------
@@ -817,16 +1045,19 @@ def _save_consult(kind: str, topic: str, sent: str, answer: str,
     directory = _consult_dir()
     stripped = topic.strip()
     heading = stripped.splitlines()[0][:120] if stripped else kind
-    # The footer arrives as a rule plus the billing line; only the line is
-    # wanted here, and on one line, because it is rendered as inline code.
-    lines = [line for line in footer.splitlines() if line.strip("- ")]
+    # The footer arrives as a rule plus the billing and usage lines; each is
+    # rendered as its own line of inline code.
+    lines = [line.strip() for line in footer.splitlines() if line.strip("- ")]
+    support = _support_line()
     body = (
         "# " + kind + ": " + heading + "\n\n"
         "*" + time.strftime("%Y-%m-%d %H:%M:%S") + " - wisdomtooth "
         + __version__ + "*\n\n"
-        "`" + (lines[-1].strip() if lines else "") + "`\n\n"
-        "## Sent to Claude\n\n" + sent + "\n\n"
-        "## Claude's answer\n\n" + answer + "\n")
+        + "".join("`" + line + "`  \n" for line in lines) + "\n"
+        + _SENT_HEADING + sent + "\n"
+        + _ANSWER_HEADING + answer + "\n"
+        + (_SUPPORT_MARK + " If it saved you time, you can support it: "
+           + support + "*\n" if support else ""))
     stamp = time.strftime("%Y%m%d-%H%M%S")
     try:
         os.makedirs(directory, exist_ok=True)
@@ -884,6 +1115,398 @@ def _result_blocks(answer: str, saved: dict) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Usage accounting
+# ---------------------------------------------------------------------------
+# Every consult is logged to a local JSON-lines ledger with the tokens it used,
+# its API-equivalent cost and how long it took. The server cannot see the plan's
+# own 5-hour and weekly meters, so this is the user's best view of what the
+# advisor spends against them -- and what the optional caps count.
+
+# USD per million tokens (input, output) at first-party API rates, matched by
+# longest prefix. Used only to *estimate*: a subscription consult is not billed
+# per token, and when the CLI reports its own API-equivalent figure that wins.
+# An unlisted model gets no estimate rather than a wrong one.
+PRICES_PER_MTOK = {
+    "claude-fable-5": (10.0, 50.0),
+    "claude-mythos-5": (10.0, 50.0),
+    "claude-opus-5": (5.0, 25.0),
+    "claude-opus-4-8": (5.0, 25.0),
+    "claude-opus-4-7": (5.0, 25.0),
+    "claude-opus-4-6": (5.0, 25.0),
+    "claude-sonnet-5": (2.0, 10.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-haiku-4-5": (1.0, 5.0),
+}
+_PRICE_PREFIXES = sorted(PRICES_PER_MTOK, key=len, reverse=True)
+CACHE_READ_FACTOR = 0.1    # cache hits bill at ~0.1x the input rate
+CACHE_WRITE_FACTOR = 1.25  # 5-minute cache writes at ~1.25x
+
+# The record of the consult in flight. A context variable rather than a
+# parameter: the backends' signatures are a contract tests and callers rely on,
+# and `asyncio.to_thread` carries the variable into the worker thread.
+_USAGE: "contextvars.ContextVar[Optional[dict]]" = contextvars.ContextVar(
+    "wisdomtooth_usage", default=None)
+
+_SESSION_RECORDS: list = []  # this process's records, used when the ledger is off
+_LEDGER_LOCK = threading.Lock()
+_LEDGER_MAX_BYTES = 2_000_000
+_LEDGER_KEEP_DAYS = 35
+_WINDOWS = (("1 h", 3600), ("5 h", 5 * 3600), ("24 h", 86400),
+            ("7 d", 7 * 86400))
+
+
+def _note_usage(**fields) -> None:
+    """Record what a backend learned about the consult it just ran."""
+    record = _USAGE.get()
+    if record is not None:
+        record.update({k: v for k, v in fields.items() if v is not None})
+
+
+def _estimate_cost(model: str, input_tokens: int = 0, output_tokens: int = 0,
+                   cache_read: int = 0, cache_write: int = 0) -> Optional[float]:
+    model = _tier_or_id(model)
+    for prefix in _PRICE_PREFIXES:
+        if model.startswith(prefix):
+            rate_in, rate_out = PRICES_PER_MTOK[prefix]
+            return round((input_tokens * rate_in
+                          + cache_read * rate_in * CACHE_READ_FACTOR
+                          + cache_write * rate_in * CACHE_WRITE_FACTOR
+                          + output_tokens * rate_out) / 1_000_000, 6)
+    return None
+
+
+def _cli_usage(payload: dict, model: str) -> dict:
+    """Tokens and cost from `claude -p --output-format json`.
+
+    `modelUsage` is preferred over `usage`: Claude Code's cost-tracking docs
+    note that `usage` can under-report on some error results, while
+    `modelUsage` and `total_cost_usd` keep the full figure.
+    """
+    per_model = payload.get("modelUsage")
+    if isinstance(per_model, dict) and per_model:
+        def total(key):
+            return sum(int(v.get(key) or 0) for v in per_model.values()
+                       if isinstance(v, dict))
+        tokens = dict(input_tokens=total("inputTokens"),
+                      output_tokens=total("outputTokens"),
+                      cache_read_tokens=total("cacheReadInputTokens"),
+                      cache_write_tokens=total("cacheCreationInputTokens"))
+    else:
+        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+        tokens = dict(
+            input_tokens=int(usage.get("input_tokens") or 0),
+            output_tokens=int(usage.get("output_tokens") or 0),
+            cache_read_tokens=int(usage.get("cache_read_input_tokens") or 0),
+            cache_write_tokens=int(usage.get("cache_creation_input_tokens") or 0))
+    try:
+        cost = float(payload["total_cost_usd"])
+        source = "cli"
+    except (KeyError, TypeError, ValueError):
+        cost = _estimate_cost(model, tokens["input_tokens"],
+                              tokens["output_tokens"],
+                              tokens["cache_read_tokens"],
+                              tokens["cache_write_tokens"])
+        source = "estimate" if cost is not None else None
+    return dict(tokens, cost_usd=cost, cost_source=source)
+
+
+def _api_usage(message, model: str) -> dict:
+    """Tokens from a Messages API response, costed at list prices."""
+    usage = getattr(message, "usage", None)
+    if usage is None:
+        return {}
+
+    def get(name):
+        try:
+            return int(getattr(usage, name, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+    tokens = dict(input_tokens=get("input_tokens"),
+                  output_tokens=get("output_tokens"),
+                  cache_read_tokens=get("cache_read_input_tokens"),
+                  cache_write_tokens=get("cache_creation_input_tokens"))
+    served_by = getattr(message, "model", None)
+    cost = _estimate_cost(served_by if isinstance(served_by, str) else model,
+                          tokens["input_tokens"], tokens["output_tokens"],
+                          tokens["cache_read_tokens"], tokens["cache_write_tokens"])
+    return dict(tokens, cost_usd=cost,
+                cost_source="estimate" if cost is not None else None)
+
+
+def _usage_record(kind: str, backend: str, model: str, effort: Optional[str],
+                  status: str, user_content: str, **extra) -> dict:
+    return dict(ts=round(time.time(), 3), time=time.strftime("%Y-%m-%dT%H:%M:%S"),
+                kind=kind, backend=backend, model=model, effort=effort,
+                status=status, prompt_chars=len(user_content), **extra)
+
+
+def _usage_path() -> str:
+    return os.path.abspath(str(_setting("usage_file")
+                               or os.path.join(_state_dir(), "usage.jsonl")))
+
+
+def _read_ledger(path: str) -> list:
+    records = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue  # a torn line from a crash costs one record
+                if isinstance(record, dict):
+                    records.append(record)
+    except OSError:
+        pass
+    return records
+
+
+def _compact_ledger(path: str) -> None:
+    cutoff = time.time() - _LEDGER_KEEP_DAYS * 86400
+    keep = [r for r in _read_ledger(path) if float(r.get("ts", 0)) >= cutoff]
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        for record in keep:
+            fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+    os.replace(tmp, path)
+
+
+def _append_usage(record: dict) -> None:
+    """Add one consult to the ledger. Never raises: accounting must not cost
+    the user the answer."""
+    with _LEDGER_LOCK:
+        _SESSION_RECORDS.append(record)
+        del _SESSION_RECORDS[:-1000]
+    if not USAGE_LOG:
+        return
+    path = _usage_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with _LEDGER_LOCK:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+            if os.path.getsize(path) > _LEDGER_MAX_BYTES:
+                _compact_ledger(path)
+    except OSError as exc:
+        print(f"[wisdomtooth] could not write the usage ledger {path}: {exc}",
+              file=sys.stderr)
+
+
+def _usage_records(since: float) -> list:
+    if USAGE_LOG:
+        source = _read_ledger(_usage_path())
+    else:
+        with _LEDGER_LOCK:
+            source = list(_SESSION_RECORDS)
+    return [r for r in source if float(r.get("ts", 0)) >= since]
+
+
+def _billed(records: list) -> list:
+    """Records whose tokens were spent: successes, and failures the backend
+    still reported usage for (a CLI run can fail after the model ran)."""
+    return [r for r in records if r.get("status") in ("ok", "error")]
+
+
+def _fmt_usd(cost: float) -> str:
+    """Cents, or enough digits that a sub-cent consult does not read as free."""
+    return f"${cost:.2f}" if cost >= 0.01 or not cost else f"${cost:.4f}"
+
+
+def _summarise(records: list) -> dict:
+    ok = [r for r in records if r.get("status") == "ok"]
+    billed = _billed(records)
+    costs = [float(r["cost_usd"]) for r in billed
+             if isinstance(r.get("cost_usd"), (int, float))]
+    times = [float(r["duration_s"]) for r in ok
+             if isinstance(r.get("duration_s"), (int, float))]
+    return {
+        "consults": len(ok),
+        "repeats": sum(1 for r in records if r.get("status") == "repeat"),
+        "errors": sum(1 for r in records if r.get("status") == "error"),
+        "input": sum(int(r.get("input_tokens") or 0)
+                     + int(r.get("cache_read_tokens") or 0)
+                     + int(r.get("cache_write_tokens") or 0) for r in billed),
+        "output": sum(int(r.get("output_tokens") or 0) for r in billed),
+        "cost": round(sum(costs), 4) if costs else None,
+        "avg_s": sum(times) / len(times) if times else None,
+    }
+
+
+def _fmt_tokens(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 10_000:
+        return f"{n / 1000:.0f}k"
+    if n >= 1000:
+        return f"{n / 1000:.1f}k"
+    return str(n)
+
+
+def _usage_footer(record: dict) -> str:
+    """One line for the answer footer: what this consult used."""
+    tokens_in = sum(int(record.get(k) or 0) for k in
+                    ("input_tokens", "cache_read_tokens", "cache_write_tokens"))
+    tokens_out = int(record.get("output_tokens") or 0)
+    if not (tokens_in or tokens_out):
+        return ""
+    text = (f"\n[usage: {tokens_in:,} tokens in · {tokens_out:,} out · "
+            f"{record.get('duration_s', 0):g}s")
+    cost = record.get("cost_usd")
+    if isinstance(cost, (int, float)):
+        text += f" · ≈{_fmt_usd(cost)} at API rates"
+    return text + "]"
+
+
+def _caps_description() -> str:
+    parts = [f"{n}/{label}" for n, label in (
+        (MAX_CONSULTS_PER_HOUR, "hour"), (MAX_CONSULTS_PER_5H, "5h"),
+        (MAX_CONSULTS_PER_WEEK, "week")) if n]
+    if MAX_USD_PER_DAY:
+        parts.append(f"${MAX_USD_PER_DAY:.2f}/day")
+    return ", ".join(parts)
+
+
+def _check_caps() -> None:
+    """Refuse a consult that would break an operator-set cap. Spends nothing."""
+    caps = ((3600, MAX_CONSULTS_PER_HOUR, "ADVISOR_MAX_CONSULTS_PER_HOUR", "hour"),
+            (5 * 3600, MAX_CONSULTS_PER_5H, "ADVISOR_MAX_CONSULTS_PER_5H",
+             "5 hours"),
+            (7 * 86400, MAX_CONSULTS_PER_WEEK, "ADVISOR_MAX_CONSULTS_PER_WEEK",
+             "7 days"))
+    if not MAX_USD_PER_DAY and not any(cap for _, cap, _, _ in caps):
+        return
+    now = time.time()
+    recent = _usage_records(now - 7 * 86400)
+    records = [r for r in recent if r.get("status") == "ok"]
+    for span, cap, var, label in caps:
+        if not cap:
+            continue
+        inside = sorted(float(r["ts"]) for r in records
+                        if float(r["ts"]) >= now - span)
+        if len(inside) >= cap:
+            opens = time.strftime(
+                "%H:%M", time.localtime(inside[len(inside) - cap] + span))
+            raise AdvisorError(
+                f"Consult cap reached: {len(inside)} consults in the last "
+                f"{label}, and the limit is {cap} ({var}). No consult was made "
+                f"and nothing was spent. The next slot opens around {opens}. "
+                f"Tell the user; do NOT retry. They can raise or unset {var}.")
+    if MAX_USD_PER_DAY:
+        spent = sum(float(r.get("cost_usd") or 0) for r in _billed(recent)
+                    if float(r["ts"]) >= now - 86400)
+        if spent >= MAX_USD_PER_DAY:
+            raise AdvisorError(
+                f"Daily spend cap reached: consults in the last 24 hours come "
+                f"to ≈{_fmt_usd(spent)} at API rates, and the limit is "
+                f"${MAX_USD_PER_DAY:.2f} (ADVISOR_MAX_USD_PER_DAY). No consult "
+                "was made. Tell the user; do NOT retry.")
+
+
+def _usage_line() -> str:
+    """The one-line summary advisor_status shows."""
+    now = time.time()
+    records = _usage_records(now - 7 * 86400)
+    parts = []
+    for label, span in (("5 h", 5 * 3600), ("7 d", 7 * 86400)):
+        s = _summarise([r for r in records if float(r["ts"]) >= now - span])
+        parts.append(f"{label}: {s['consults']} consults, "
+                     f"{_fmt_tokens(s['input'])} in / {_fmt_tokens(s['output'])} out"
+                     + (f", ≈{_fmt_usd(s['cost'])}" if s["cost"] is not None
+                        else ""))
+    return "; ".join(parts) + " (API-rate estimate)"
+
+
+def _usage_report(days: int = 7) -> str:
+    try:
+        days = max(1, min(int(days or 7), _LEDGER_KEEP_DAYS))
+    except (TypeError, ValueError):
+        days = 7
+    now = time.time()
+    records = _usage_records(now - max(days, 7) * 86400)
+    where = (_usage_path() if USAGE_LOG
+             else "disabled (ADVISOR_USAGE_LOG=0), so this server process only")
+    lines = [f"USAGE LEDGER: {where}", "",
+             f"{'window':<8}{'consults':>9}{'repeats':>9}{'errors':>8}"
+             f"{'tokens in':>11}{'tokens out':>12}{'≈ cost':>10}{'avg time':>10}"]
+    for label, span in _WINDOWS:
+        s = _summarise([r for r in records if float(r["ts"]) >= now - span])
+        cost = _fmt_usd(s["cost"]) if s["cost"] is not None else "-"
+        avg = f"{s['avg_s']:.0f}s" if s["avg_s"] is not None else "-"
+        lines.append(f"{label:<8}{s['consults']:>9}{s['repeats']:>9}"
+                     f"{s['errors']:>8}{_fmt_tokens(s['input']):>11}"
+                     f"{_fmt_tokens(s['output']):>12}{cost:>10}{avg:>10}")
+    by_model: dict = {}
+    for r in records:
+        if float(r["ts"]) >= now - days * 86400 and r.get("status") == "ok":
+            by_model.setdefault(r.get("model") or "?", []).append(r)
+    lines += ["", f"BY MODEL, last {days} day(s):"]
+    if not by_model:
+        lines.append("  (no consults)")
+    for model, rows in sorted(by_model.items()):
+        s = _summarise(rows)
+        lines.append(f"  {model:<22} {s['consults']:>4} consults  "
+                     f"{_fmt_tokens(s['input'])} in / {_fmt_tokens(s['output'])} out"
+                     + (f"  ≈{_fmt_usd(s['cost'])}" if s["cost"] is not None
+                        else ""))
+    lines += [
+        "",
+        "CAPS: " + (_caps_description() or "none set (ADVISOR_MAX_CONSULTS_PER_"
+                    "HOUR / _5H / _WEEK, ADVISOR_MAX_USD_PER_DAY)"),
+        "REPEAT GUARD: " + (f"identical consults within {REPEAT_WINDOW_S / 60:g} "
+                            "min return the saved answer at no cost"
+                            if REPEAT_WINDOW_S else "off"),
+        "",
+        "Cost is what these tokens would cost at API rates. Subscription "
+        "consults are not billed per token, but this is a fair proxy for how "
+        "much of the plan's 5-hour and weekly allowance they use. The plan's "
+        "own meter is not visible to this server."]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Repeat guard
+# ---------------------------------------------------------------------------
+
+_RECENT: dict = {}
+_RECENT_LOCK = threading.Lock()
+
+
+def _repeat_key(*parts) -> str:
+    digest = hashlib.sha256()
+    for part in parts:
+        digest.update(str(part).encode("utf-8", errors="replace") + b"\0")
+    return digest.hexdigest()
+
+
+def _recall(key: str) -> Optional[dict]:
+    if not REPEAT_WINDOW_S:
+        return None
+    with _RECENT_LOCK:
+        hit = _RECENT.get(key)
+    if hit and time.time() - hit["ts"] <= REPEAT_WINDOW_S:
+        return hit
+    return None
+
+
+def _remember(key: str, **entry) -> None:
+    if not REPEAT_WINDOW_S:
+        return
+    now = time.time()
+    with _RECENT_LOCK:
+        for stale in [k for k, v in _RECENT.items()
+                      if now - v["ts"] > REPEAT_WINDOW_S]:
+            del _RECENT[stale]
+        _RECENT[key] = dict(entry, ts=now)
+
+
+def _support_line() -> str:
+    return SUPPORT_URL if SUPPORT_URL and SHOW_SUPPORT else ""
+
+
+# ---------------------------------------------------------------------------
 # Subprocess plumbing for the Claude Code CLI
 # ---------------------------------------------------------------------------
 
@@ -913,6 +1536,39 @@ def _kill_tree(proc: "subprocess.Popen") -> None:
             proc.kill()
 
 
+class _Cancellation:
+    """Lets the async tool wrapper stop a consult running in a worker thread.
+
+    `asyncio.to_thread` cannot interrupt its thread, so a client that gave up
+    on a consult used to leave `claude` running -- and spending quota -- until
+    it finished or timed out. The wrapper puts one of these in a context
+    variable, which `to_thread` copies into the worker; `_run_claude` registers
+    each process it starts, and `cancel` kills it.
+    """
+
+    def __init__(self):
+        self.cancelled = False
+        self.proc = None
+        self._lock = threading.Lock()
+
+    def attach(self, proc) -> bool:
+        """Register `proc`; False if the consult was already cancelled."""
+        with self._lock:
+            self.proc = proc
+            return not self.cancelled
+
+    def cancel(self) -> None:
+        with self._lock:
+            self.cancelled = True
+            proc = self.proc
+        if proc is not None and proc.poll() is None:
+            _kill_tree(proc)
+
+
+_CANCELLATION: "contextvars.ContextVar[Optional[_Cancellation]]" = (
+    contextvars.ContextVar("wisdomtooth_cancellation", default=None))
+
+
 def _wrap_for_windows(cmd: list) -> list:
     """npm-installed Claude Code resolves to claude.cmd/.bat, which
     CreateProcess cannot exec directly -- route those through cmd /c."""
@@ -938,9 +1594,11 @@ def _run_claude(cmd, env=None, workdir=None, timeout_s=60, stdin_text=""):
         popen_kwargs["start_new_session"] = True  # own process group for killpg
 
     proc = subprocess.Popen(_wrap_for_windows(list(cmd)), **popen_kwargs)
+    holder = _CANCELLATION.get()
+    if holder is not None and not holder.attach(proc):
+        _kill_tree(proc)
     try:
         out, err = proc.communicate(input=stdin_text, timeout=timeout_s)
-        return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
     except subprocess.TimeoutExpired:
         _kill_tree(proc)
         try:
@@ -948,6 +1606,10 @@ def _run_claude(cmd, env=None, workdir=None, timeout_s=60, stdin_text=""):
         except Exception:
             out, err = "", ""
         raise subprocess.TimeoutExpired(cmd, timeout_s, output=out, stderr=err)
+    if holder is not None and holder.cancelled:
+        raise AdvisorError("The consult was cancelled by the client, and the "
+                           "claude process was stopped.")
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
 _FEATURE_CACHE: dict = {}
@@ -978,7 +1640,11 @@ def _cli_features(claude_bin: str) -> set:
     except Exception as exc:  # a failed probe must not block the consult
         print(f"[wisdomtooth] could not probe `claude --help`: {exc}",
               file=sys.stderr)
-    _FEATURE_CACHE[claude_bin] = flags
+    # Only a probe that found something is cached. A timed-out or broken probe
+    # would otherwise pin this process to a bare command line -- no JSON
+    # output, no usage figures, no `--tools ""` -- until it restarts.
+    if flags:
+        _FEATURE_CACHE[claude_bin] = flags
     return flags
 
 
@@ -1003,16 +1669,28 @@ def _child_env() -> dict:
 
 
 def _system_prompt_file(system: str) -> str:
-    """Write the system prompt beside the workdir and return its path.
+    """Write this consult's system prompt to a file of its own; return the path.
 
-    Rewritten per consult because `extra_system` differs by tool, and kept out
-    of the workdir itself so the CLI never sees it as project content.
+    One file per consult. A shared path is rewritten by every concurrent
+    consult -- a parallel review_code, or another client's server process --
+    so a CLI reading it a moment later could get another consult's prompt, or
+    a half-written one. The caller deletes it once the CLI exits. Kept beside
+    the workdir, not in it, so the CLI never sees it as project content.
     """
-    path = os.path.join(_state_dir(), "system-prompt.txt")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
+    directory = os.path.join(_state_dir(), "prompts")
+    os.makedirs(directory, exist_ok=True)
+    fd, path = tempfile.mkstemp(prefix="system-prompt-", suffix=".txt",
+                                dir=directory)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(system)
     return path
+
+
+def _remove_quietly(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def _workdir() -> str:
@@ -1081,8 +1759,10 @@ def _consult_claude_code(system: str, user_content: str, model: str,
     # Prefer the file form -- the prompt is multi-line, and a multi-line argv
     # element is truncated at the first newline when an npm-installed CLI is
     # invoked through `cmd /c claude.cmd`.
+    prompt_file = None
     if "--system-prompt-file" in features:
-        cmd += ["--system-prompt-file", _system_prompt_file(system)]
+        prompt_file = _system_prompt_file(system)
+        cmd += ["--system-prompt-file", prompt_file]
     elif "--system-prompt" in features:
         cmd += ["--system-prompt", system]
     else:  # pragma: no cover - only on a CLI too old to have either
@@ -1122,10 +1802,16 @@ def _consult_claude_code(system: str, user_content: str, model: str,
             "ADVISOR_ANSWER_BUDGET. Do NOT retry in a loop; surface this to the "
             "user. stderr tail: " + tail[-400:]
         ) from exc
+    finally:
+        if prompt_file:
+            _remove_quietly(prompt_file)
 
     blob = ((result.stderr or "") + " " + (result.stdout or "")).lower()
 
     answer, payload = _parse_cli_output(result.stdout or "")
+    if payload:
+        # Before the failure checks: a failed run can still have been billed.
+        _note_usage(**_cli_usage(payload, model))
     failed = result.returncode != 0 or (payload or {}).get("is_error")
 
     if failed:
@@ -1179,11 +1865,21 @@ def _extract_text(message) -> str:
 def _stream(messages_api, **kwargs):
     """Every request is streamed.
 
-    max_tokens here can reach 48k on high-effort adaptive-thinking models, and
+    max_tokens here reaches 128k on high-effort adaptive-thinking models, and
     the SDKs require streaming above roughly 8k output tokens or the request
     trips the HTTP timeout.
+
+    Events are consumed here rather than inside `get_final_message` so that a
+    consult the client cancelled stops at the next event: leaving the `with`
+    block closes the HTTP stream, and the model stops generating billed tokens.
     """
+    holder = _CANCELLATION.get()
     with messages_api.stream(**kwargs) as stream:
+        if holder is not None and hasattr(stream, "__iter__"):
+            for _event in stream:
+                if holder.cancelled:
+                    raise AdvisorError("The consult was cancelled by the "
+                                       "client, and the API request was closed.")
         return stream.get_final_message()
 
 
@@ -1234,6 +1930,7 @@ def _consult_api(system: str, user_content: str, model: str,
             message = _stream(api.messages, system=system, messages=messages,
                               **kwargs)
 
+    _note_usage(**_api_usage(message, model))
     if getattr(message, "stop_reason", None) == "refusal":
         details = getattr(message, "stop_details", None)
         category = getattr(details, "category", None) or "unspecified"
@@ -1288,7 +1985,7 @@ def _active_backend() -> str:
     Returns "claude-code", "api", or "unavailable".
     """
     global _ACTIVE_BACKEND
-    if BACKEND in ("claude-code", "api"):
+    if BACKEND in _BACKENDS:
         return BACKEND  # an explicit choice is never second-guessed
     if _ACTIVE_BACKEND is not None:
         return _ACTIVE_BACKEND
@@ -1411,8 +2108,11 @@ def _login(force: bool = False, wait_seconds: int = 180) -> str:
               "account whose Pro/Max subscription you want the advisor to use.")
 
     deadline = time.time() + max(0, int(wait_seconds))
+    holder = _CANCELLATION.get()
     while time.time() < deadline:
         time.sleep(_LOGIN_POLL_SECONDS)
+        if holder is not None and holder.cancelled:
+            break  # the client gave up waiting; nobody reads the result
         status = _cli_auth_status() or {}
         if status.get("loggedIn"):
             _invalidate_backend()
@@ -1444,10 +2144,53 @@ _NO_CREDENTIALS = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Backends
+# ---------------------------------------------------------------------------
+# The seam for other frontier providers. A backend is a name the user can put
+# in ADVISOR_BACKEND, the account it bills (for the footer and advisor_status),
+# a readiness check, and one function with `_consult_api`'s signature that
+# returns the answer text. Launch ships the two Claude backends; a ChatGPT or
+# Kimi backend registers the same way, and reports its tokens through
+# `_note_usage` so the ledger, the caps and the repeat guard cover it too.
+
+@dataclass(frozen=True)
+class Backend:
+    name: str
+    provider: str
+    billing: str
+    consult: Callable[[str, str, str, Optional[str], int], str]
+    available: Callable[[], bool]
+
+
+_BACKENDS: dict = {}
+
+
+def register_backend(backend: Backend) -> None:
+    """Make `backend` selectable with ADVISOR_BACKEND=<backend.name>."""
+    _BACKENDS[backend.name] = backend
+
+
+# Lambdas rather than the functions themselves: they look the function up at
+# call time, so a replaced module attribute (tests, embedding) is honoured.
+register_backend(Backend(
+    name="claude-code", provider="anthropic",
+    billing="Claude SUBSCRIPTION (Pro/Max) via the local Claude Code CLI",
+    consult=lambda s, u, m, e, t: _consult_claude_code(s, u, m, e),
+    available=lambda: bool(_claude_bin())))
+register_backend(Backend(
+    name="api", provider="anthropic",
+    billing="API ACCOUNT (pay-per-token via ANTHROPIC_API_KEY)",
+    consult=lambda s, u, m, e, t: _consult_api(s, u, m, e, t),
+    available=lambda: _api_credentials_present()))
+
+
 def _consult(question: str, context: str = "", extra_system: str = "",
              model: str = "", effort: str = "", max_tokens: int = 0,
              scrub_context: bool = True, kind: str = "consult",
-             saved: Optional[dict] = None) -> str:
+             saved: Optional[dict] = None,
+             context_files: Optional[list] = None,
+             follow_up_of: str = "") -> str:
     """One stateless consult, on whichever backend is active.
 
     `kind` names the calling tool, for the transcript. `saved` is an optional
@@ -1456,10 +2199,20 @@ def _consult(question: str, context: str = "", extra_system: str = "",
     An out-parameter rather than a richer return type because the answer string
     IS this function's contract -- every caller, and most of the test suite,
     treats it as one.
+
+    `follow_up_of` re-sends an earlier saved exchange and `context_files` are
+    read by the server itself. Both land in `context`, so both pass through the
+    same redaction and size cap as anything the caller pasted.
     """
     system = (ADVISOR_SYSTEM_PROMPT + ("\n" + extra_system if extra_system else "")
               + _answer_budget_instruction())
     question = _scrub_nsfw(question)
+    parts = [_load_previous_consult(follow_up_of)] if follow_up_of else []
+    if context:
+        parts.append(context)
+    if context_files:
+        parts.append(_read_context_files(context_files))
+    context = "\n\n".join(parts)
     context = _sanitize(context, scrub=scrub_context) if context else context
     user_content = question if not context else (
         f"<context>\n{context}\n</context>\n\n{question}")
@@ -1470,6 +2223,68 @@ def _consult(question: str, context: str = "", extra_system: str = "",
 
     if backend == "unavailable":
         raise AdvisorError(_NO_CREDENTIALS)
+
+    key = _repeat_key(kind, backend, model, effort, max_tokens, system,
+                      user_content)
+    hit = _recall(key)
+    if hit:
+        _append_usage(_usage_record(kind, backend, model, effort, "repeat",
+                                    user_content, transcript=hit["path"]))
+        if saved is not None:
+            saved["path"] = hit["path"]
+        return (hit["answer"] + hit["footer"]
+                + "\n[repeat: identical to a consult at "
+                + time.strftime("%H:%M", time.localtime(hit["ts"]))
+                + " -- this is that answer again, at no cost. To consult "
+                "afresh, change the question or add what is new to "
+                "`context`.]")
+    _check_caps()
+
+    record = _usage_record(kind, backend, model, effort, "ok", user_content)
+    token = _USAGE.set(record)
+    started = time.monotonic()
+    try:
+        answer, footer = _consult_backend(system, user_content, model, effort,
+                                          max_tokens, backend)
+    except Exception as exc:
+        record.update(status="error", error=exc.__class__.__name__,
+                      duration_s=round(time.monotonic() - started, 1))
+        _append_usage(record)
+        raise
+    finally:
+        _USAGE.reset(token)
+    record.update(duration_s=round(time.monotonic() - started, 1),
+                  answer_chars=len(answer))
+    footer += _usage_footer(record)
+
+    path = _save_consult(kind, question, user_content, answer, footer)
+    if saved is not None:
+        saved["path"] = path
+    if path:
+        # In the footer rather than a block of its own: a client that renders
+        # nothing but text is the common case, and this is the line that tells
+        # the user their answer outlived the chat window.
+        # Backticked: clients render the footer as Markdown, and an unquoted
+        # Windows path loses its backslashes to escape processing.
+        footer += ("\n[saved: `" + path + "` — the full answer is in this file; "
+                   "give the user this path so they can read it outside the "
+                   "chat]")
+    record["transcript"] = path
+    _append_usage(record)
+    _remember(key, answer=answer, footer=footer, path=path)
+    return answer + footer
+
+
+def _consult_backend(system: str, user_content: str, model: str,
+                     effort: Optional[str], max_tokens: int,
+                     backend: str) -> tuple:
+    """Run one consult on `backend`; return (answer, billing footer)."""
+    if backend not in ("claude-code", "api"):
+        spec = _BACKENDS[backend]
+        answer = spec.consult(system, user_content, model, effort, max_tokens)
+        return answer, (f"\n\n---\n[advisor: {backend}/{model} · billed to "
+                        f"{spec.billing}"
+                        + (f" · effort={effort}" if effort else "") + "]")
 
     if backend == "claude-code":
         try:
@@ -1482,6 +2297,7 @@ def _consult(question: str, context: str = "", extra_system: str = "",
             if not (BACKEND == "auto" and FALLBACK_TO_API
                     and _api_credentials_present()):
                 raise
+            _note_usage(backend="api")
             answer = _consult_api(system, user_content, model, effort, max_tokens)
             footer = (
                 f"\n\n---\n[advisor: {model} · billed to API ACCOUNT "
@@ -1503,19 +2319,7 @@ def _consult(question: str, context: str = "", extra_system: str = "",
                   + (f" · effort={effort}" if effort else "")
                   + f" · max_tokens={_resolve_max_tokens(max_tokens)}]")
 
-    path = _save_consult(kind, question, user_content, answer, footer)
-    if saved is not None:
-        saved["path"] = path
-    if path:
-        # In the footer rather than a block of its own: a client that renders
-        # nothing but text is the common case, and this is the line that tells
-        # the user their answer outlived the chat window.
-        # Backticked: clients render the footer as Markdown, and an unquoted
-        # Windows path loses its backslashes to escape processing.
-        footer += ("\n[saved: `" + path + "` — the full answer is in this file; "
-                   "give the user this path so they can read it outside the "
-                   "chat]")
-    return answer + footer
+    return answer, footer
 
 
 # ---------------------------------------------------------------------------
@@ -1606,29 +2410,50 @@ def _model_catalogue() -> str:
 
 
 async def _consult_with_heartbeat(ctx: Optional[Context], *args, **kwargs):
-    """Run `_consult` off the event loop, reporting progress while it works.
+    """Run `_consult` off the event loop, reporting progress while it works."""
+    return await _with_heartbeat(ctx, _consult, *args, **kwargs)
+
+
+async def _with_heartbeat(ctx: Optional[Context], fn, *args,
+                          message: str = "Claude is still working", **kwargs):
+    """Run blocking `fn` in a worker thread, reporting progress while it works.
 
     A consult is otherwise silent for its whole run, and MCP clients abort a
     silent tool call at their own request timeout -- shorter than a large
-    consult. A progress notification restarts that clock in clients that ask
-    for progress (Kilo does), and is a no-op for one that sent no progress
-    token, so the heartbeat runs unconditionally.
+    consult, and than `advisor_login`'s default wait. A progress
+    notification restarts that clock in clients that ask for progress (Kilo
+    does), and is a no-op for one that sent no progress token, so the
+    heartbeat runs unconditionally.
     """
-    work = asyncio.ensure_future(asyncio.to_thread(_consult, *args, **kwargs))
+    holder = _Cancellation()
+    reset = _CANCELLATION.set(holder)
+    try:
+        # The task copies the current context, holder included, into the
+        # worker thread `to_thread` starts.
+        work = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
+    finally:
+        _CANCELLATION.reset(reset)
     started = time.monotonic()
-    while True:
-        done, _ = await asyncio.wait({work}, timeout=PROGRESS_INTERVAL)
-        if done:
-            return work.result()
-        if ctx is None:
-            continue
-        elapsed = int(time.monotonic() - started)
-        try:
-            await ctx.report_progress(
-                elapsed, message=f"Claude is still working ({elapsed}s elapsed)")
-        except Exception as exc:  # a lost heartbeat must not cost the answer
-            print(f"[wisdomtooth] progress notification failed: {exc}",
-                  file=sys.stderr)
+    try:
+        while True:
+            done, _ = await asyncio.wait({work}, timeout=PROGRESS_INTERVAL)
+            if done:
+                return work.result()
+            if ctx is None:
+                continue
+            elapsed = int(time.monotonic() - started)
+            try:
+                await ctx.report_progress(
+                    elapsed, message=f"{message} ({elapsed}s elapsed)")
+            except Exception as exc:  # a lost heartbeat must not cost the answer
+                print(f"[wisdomtooth] progress notification failed: {exc}",
+                      file=sys.stderr)
+    except asyncio.CancelledError:
+        # The client gave up: stop the CLI so it stops spending quota. The
+        # worker then finishes on its own; its result is discarded.
+        holder.cancel()
+        work.add_done_callback(lambda f: f.cancelled() or f.exception())
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -1638,7 +2463,10 @@ async def _consult_with_heartbeat(ctx: Optional[Context], *args, **kwargs):
 @tool(title="Ask Wisdomtooth (escalation)", annotations=CONSULT_ANNOTATIONS)
 async def ask_wisdomtooth(question: str, context: str, attempts_so_far: str,
                           model: str = "", effort: str = "",
-                          max_tokens: int = 0, ctx: Optional[Context] = None):
+                          max_tokens: int = 0,
+                          context_files: Optional[list[str]] = None,
+                          follow_up_of: str = "",
+                          ctx: Optional[Context] = None):
     """ESCALATION: Ask Wisdomtooth for expert advice when you are stuck.
 
     WHEN TO USE — only when BOTH conditions hold:
@@ -1662,10 +2490,10 @@ async def ask_wisdomtooth(question: str, context: str, attempts_so_far: str,
             including what Context7/docs/search returned (or why it wasn't
             helpful). Required — it prevents the advisor from repeating
             failed suggestions.
-        model: Pick based on question complexity. "deep" (Opus, default) for
+        model: Pick based on question complexity. "deep" (Opus) for
             architecture, subtle cross-system behavior, and debugging that has
-            resisted earlier attempts; "balanced" (Sonnet) for ordinary
-            stuck-on-implementation problems; "fast" (Haiku) for quick sanity
+            resisted earlier attempts; "balanced" (Sonnet, the usual default)
+            for ordinary stuck-on-implementation problems; "fast" (Haiku) for quick sanity
             checks or factual confirmations. A full model ID string is also
             accepted. Leave empty for the configured default.
         effort: Reasoning effort: "low", "medium", "high", "xhigh", or "max".
@@ -1678,6 +2506,13 @@ async def ask_wisdomtooth(question: str, context: str, attempts_so_far: str,
             default). Raise it when you expect a long design document; lower it
             for a quick yes/no. Applies to the API backend only — the Claude
             Code CLI has no equivalent flag.
+        context_files: Paths of files for the server to read and attach
+            itself, instead of pasting them into `context`; this saves your
+            own context window. Relative paths resolve against the project
+            folder; files outside it, and credential files, are refused.
+        follow_up_of: To continue an earlier consult, the file name from its
+            `[saved: ...]` line. The advisor then sees its earlier question and
+            answer, so put only what is new in `context`.
     """
     saved: dict = {}
     answer = await _consult_with_heartbeat(
@@ -1689,6 +2524,8 @@ async def ask_wisdomtooth(question: str, context: str, attempts_so_far: str,
         max_tokens=max_tokens,
         kind="ask_wisdomtooth",
         saved=saved,
+        context_files=context_files,
+        follow_up_of=follow_up_of,
     )
     return _result_blocks(answer, saved)
 
@@ -1696,7 +2533,9 @@ async def ask_wisdomtooth(question: str, context: str, attempts_so_far: str,
 @tool(title="Review code with Claude", annotations=CONSULT_ANNOTATIONS)
 async def review_code(code: str, concern: str = "general quality",
                       model: str = "", effort: str = "",
-                      max_tokens: int = 0, ctx: Optional[Context] = None):
+                      max_tokens: int = 0,
+                      context_files: Optional[list[str]] = None,
+                      ctx: Optional[Context] = None):
     """ESCALATION: Have Claude review code you are unsure about.
 
     WHEN TO USE: after implementing something non-trivial where you have
@@ -1708,17 +2547,21 @@ async def review_code(code: str, concern: str = "general quality",
         code: The code to review (include the language if not obvious).
         concern: What to focus on — e.g. "security", "performance",
             "correctness of this async logic", or "general quality".
-        model: "deep" (default) for security-critical or subtle concurrency
-            code, "balanced" for a routine review, "fast" for a sanity pass.
+        model: "deep" for security-critical or subtle concurrency code,
+            "balanced" for a routine review, "fast" for a sanity pass. Empty
+            uses the configured default.
             Full model IDs also accepted.
         effort: "low"/"medium"/"high"/"xhigh"/"max" - scale with how subtle
             the code is. Ignored on models without effort support.
         max_tokens: Cap the review length for this call (0 = configured
             default). Applies to the API backend only.
+        context_files: Paths of related files (callers, interfaces, tests)
+            for the server to read and attach, relative to the project folder.
     """
     saved: dict = {}
     answer = await _consult_with_heartbeat(
         ctx,
+        context_files=context_files,
         question=f"Review this code with a focus on: {concern}. "
         "List concrete issues in priority order, with suggested fixes.",
         context=code,
@@ -1754,8 +2597,9 @@ async def compare_approaches(problem: str, options: str, criteria: str = "",
         options: The candidate approaches, described one per line.
         criteria: Optional decision criteria (e.g. "must be low-latency,
             team knows Python, ships this week").
-        model: "deep" (default) for high-stakes, hard-to-reverse architectural
-            choices; "balanced" for everyday decisions.
+        model: "deep" for high-stakes, hard-to-reverse architectural
+            choices; "balanced" for everyday decisions. Empty uses the
+            configured default.
         effort: "medium" for routine tradeoffs, "high"/"xhigh"/"max" for
             decisions with long-term consequences.
         max_tokens: Cap the answer length for this call (0 = configured
@@ -1781,7 +2625,8 @@ CREDENTIAL_ANNOTATIONS = ToolAnnotations(
 
 @tool(title="Connect a Claude subscription account",
       annotations=CREDENTIAL_ANNOTATIONS)
-async def advisor_login(force: bool = False, wait_seconds: int = 180) -> str:
+async def advisor_login(force: bool = False, wait_seconds: int = 180,
+                        ctx: Optional[Context] = None) -> str:
     """Connect the user's Claude account so consults use their SUBSCRIPTION.
 
     FREE — makes no model call. Opens the official Claude Code sign-in
@@ -1806,8 +2651,10 @@ async def advisor_login(force: bool = False, wait_seconds: int = 180) -> str:
             (0 skips waiting). Returning early is not a failure — call
             advisor_login again to check.
     """
-    return await asyncio.to_thread(_login, force=force,
-                                   wait_seconds=wait_seconds)
+    # Heartbeat: the default wait outlasts a client's silence timeout.
+    return await _with_heartbeat(ctx, _login, force=force,
+                                 wait_seconds=wait_seconds,
+                                 message="Waiting for the browser sign-in")
 
 
 @tool(title="Save a Claude subscription token",
@@ -1888,8 +2735,23 @@ def advisor_configure(model: str = "", effort: str = "", max_tokens: int = 0,
                       answer_budget=answer_budget, reset=reset)
 
 
+@tool(title="Advisor usage and spend", annotations=LOCAL_ANNOTATIONS)
+def advisor_usage(days: int = 7) -> str:
+    """Report the advisor's consults, tokens and estimated cost over time.
+
+    FREE — makes no model call; reads the local usage ledger. Use when the
+    user asks how much the advisor has used, or before a burst of consults
+    when their plan's limits are tight. Cost is an estimate at API rates; the
+    subscription's own meter is not visible to this server.
+
+    Args:
+        days: How far back the per-model breakdown goes (1-35).
+    """
+    return _usage_report(days)
+
+
 @tool(title="Check advisor credentials", annotations=LOCAL_ANNOTATIONS)
-async def advisor_auth_check() -> str:
+async def advisor_auth_check(ctx: Optional[Context] = None) -> str:
     """Diagnose login/credential readiness WITHOUT spending tokens.
 
     Run this FIRST whenever a consult fails, hangs, or before the initial
@@ -1897,7 +2759,9 @@ async def advisor_auth_check() -> str:
     and any auth-hijacking env vars. It cannot log in for you — OAuth requires
     a human in a terminal.
     """
-    return await asyncio.to_thread(_auth_report)
+    # Two CLI probes of up to 30s each: longer than some clients stay silent.
+    return await _with_heartbeat(ctx, _auth_report,
+                                 message="Checking the Claude CLI")
 
 
 def _auth_report() -> str:
@@ -1988,7 +2852,8 @@ def advisor_status() -> str:
         "api": "DEVELOPER API account (pay-per-token via ANTHROPIC_API_KEY) — "
                "NOT the Pro/Max subscription",
         "unavailable": "NONE — no usable credentials; run advisor_auth_check",
-    }[backend]
+    }.get(backend) or (_BACKENDS[backend].billing if backend in _BACKENDS
+                       else backend)
     if not SAVE_CONSULTS:
         transcripts = "disabled (ADVISOR_SAVE_CONSULTS=0)"
     elif CONSULT_KEEP:
@@ -2007,8 +2872,16 @@ def advisor_status() -> str:
         f"answer budget: {_effective_answer_budget() or 'unlimited'} words"
         + ("" if _effective_answer_budget() else
            " (a long answer can overflow a small caller's context)"),
-        f"tool surface: {'minimal (ask_wisdomtooth, advisor_status)' if MINIMAL_TOOLS else 'full (10 tools)'}",
+        f"tool surface: {'minimal (ask_wisdomtooth, advisor_status)' if MINIMAL_TOOLS else 'full (11 tools)'}",
         f"consult transcripts: {transcripts}",
+        f"usage: {_usage_line()}",
+        "usage ledger: " + (_usage_path() if USAGE_LOG
+                            else "disabled (ADVISOR_USAGE_LOG=0)"),
+        "consult caps: " + (_caps_description() or "none"),
+        "repeat guard: " + (f"{REPEAT_WINDOW_S / 60:g} min" if REPEAT_WINDOW_S
+                            else "off"),
+        "file roots for context_files: "
+        + (", ".join(_file_roots()) or "none (set ADVISOR_FILE_ROOTS)"),
         f"timeout: {TIMEOUT}s base"
         + (f", grows with input size, answer budget and effort "
            f"(scale {TIMEOUT_SCALE:g}), cap {TIMEOUT_MAX}s" if TIMEOUT_SCALE
@@ -2049,7 +2922,18 @@ def _billing_banner() -> str:
 
 def main() -> None:
     print(_billing_banner(), file=sys.stderr)
+    support = _support_line()
+    if support:
+        print(f"[wisdomtooth] free and open source; support it at {support} "
+              "(ADVISOR_SHOW_SUPPORT=0 hides this line)", file=sys.stderr)
     if TRANSPORT == "http":
+        if HTTP_HOST not in ("127.0.0.1", "localhost", "::1"):
+            # Inside a container 0.0.0.0 is normal (the port mapping is the
+            # guard), so warn rather than refuse.
+            print(f"[wisdomtooth] WARNING: the HTTP transport on {HTTP_HOST}:"
+                  f"{HTTP_PORT} has no authentication -- anyone who can reach "
+                  "it can spend this account. Keep it on 127.0.0.1, or publish "
+                  "a container port only to localhost.", file=sys.stderr)
         if _MCP_MAJOR >= 2:
             mcp.run("streamable-http", host=HTTP_HOST, port=HTTP_PORT)
         else:  # pragma: no cover - mcp 1.x settings object

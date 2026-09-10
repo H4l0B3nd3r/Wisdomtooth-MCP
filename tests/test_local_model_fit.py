@@ -17,11 +17,14 @@ def consult(srv, **kw):
 
 
 def system_prompt_sent(fake_claude):
-    """The system prompt the CLI actually received, read back from disk."""
-    path = fake_claude.flag_value("--system-prompt-file")
-    assert path, "expected the system prompt to travel as a file"
-    with open(path, encoding="utf-8") as fh:
-        return fh.read()
+    """The system prompt the CLI actually received.
+
+    Read by the fake CLI while it ran: the server deletes each consult's
+    prompt file once the CLI exits.
+    """
+    assert fake_claude.flag_value("--system-prompt-file"), (
+        "expected the system prompt to travel as a file")
+    return fake_claude.last["system_prompt"]
 
 
 # --------------------------------------------------------------------------

@@ -1,22 +1,20 @@
 // RECOMMENDED FOR LOCAL MODELS (LM Studio / Ollama / llama.cpp driving Kilo).
 //
-// Two settings here exist because the consumer is a small model, and they are
-// the difference between this tool helping and hurting:
+// ADVISOR_PRESET=small sizes the advisor for a small caller in one setting:
 //
-//   ADVISOR_MINIMAL_TOOLS  advertises only ask_wisdomtooth + advisor_status.
-//                          Tool schemas are charged against the local model's
-//                          context on EVERY turn: ~3340 tokens with all 10
-//                          tools, ~1090 with two. On an 8k window that is 41%
-//                          vs 13%. A shorter list also improves tool-selection
-//                          accuracy. The operator tools still work -- flip this
-//                          to "0" for a session when you need them.
+//   - minimal tool surface: only ask_wisdomtooth + advisor_status are
+//     advertised. Tool schemas are charged against the local model's context
+//     on EVERY turn: ~3340 tokens with all tools, ~1090 with two. On an 8k
+//     window that is 41% vs 13%, and a shorter list also improves
+//     tool-selection accuracy. Set ADVISOR_MINIMAL_TOOLS=0 for a session when
+//     you need the operator tools.
 //
-//   ADVISOR_ANSWER_BUDGET  target answer length in words. Claude's reply lands
-//                          INSIDE the local model's context, and an unbounded
-//                          answer can exceed a small model's whole window.
-//                          Enforced via the system prompt, which is the only
-//                          lever that works on the subscription backend --
-//                          ADVISOR_MAX_TOKENS is API-backend only.
+//   - a 600-word answer ceiling. Claude's reply lands INSIDE the local model's
+//     context, and an unbounded answer can exceed a small model's whole
+//     window. Enforced via the system prompt, the only lever that works on the
+//     subscription backend (ADVISOR_MAX_TOKENS is API-backend only).
+//
+// Use "medium" instead for 32k-200k context models.
 {
   "mcp": {
     "wisdomtooth": {
@@ -27,14 +25,17 @@
         "ADVISOR_BACKEND": "claude-code",
 
         // Sized for a small caller.
-        "ADVISOR_MINIMAL_TOOLS": "1",
-        "ADVISOR_ANSWER_BUDGET": "500",
+        "ADVISOR_PRESET": "small",
 
         // Sonnet by default: a local model escalates often, and Opus on every
         // consult exhausts a Pro plan's headless quota. The agent can still
         // pass model="deep" per call for the hard ones.
         "ADVISOR_MODEL": "balanced",
         "ADVISOR_EFFORT": "high"
+
+        // Optional guard rails for an agent that escalates too eagerly:
+        // "ADVISOR_MAX_CONSULTS_PER_5H": "10",
+        // "ADVISOR_MAX_CONSULTS_PER_WEEK": "60"
       },
       "enabled": true,
       // Restarted by the server's 15s progress heartbeat; consults may run longer.

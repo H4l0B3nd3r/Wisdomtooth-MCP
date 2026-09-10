@@ -19,7 +19,7 @@ PKG_ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_TOOLS = {"ask_wisdomtooth", "review_code", "compare_approaches",
                   "advisor_status", "advisor_auth_check", "advisor_models",
                   "advisor_configure", "advisor_login", "advisor_set_token",
-                  "advisor_logout"}
+                  "advisor_logout", "advisor_usage"}
 
 
 def _params(**env):

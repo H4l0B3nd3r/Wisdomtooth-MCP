@@ -51,13 +51,26 @@ The advisor is **stateless** — it sees only what you pass. Always include:
 If two escalations on the same problem don't unblock you, stop and ask the
 user rather than looping.
 
+### Saving your own context
+
+- Pass files as `context_files` (paths relative to the project) instead of
+  pasting them into `context`; the server reads them itself. Credential files
+  are refused, so excerpt around secrets if you must.
+- To continue an earlier consult, pass the file name from its `[saved: ...]`
+  line as `follow_up_of`, and put only what is new in `context`.
+- Asking the identical question again within 30 minutes returns the saved
+  answer, marked `[repeat: ...]`. That is not new advice: if it didn't help,
+  stop and ask the user.
+- A "Consult cap reached" error means the user limited how often you may
+  escalate. Tell them; do not retry.
+
 ## Choosing model, effort, and length
 
 Call `advisor_models` (free, no model call) if you are unsure what is available.
 
-- `model`: `deep` (Opus, the default) for architecture, subtle cross-system
+- `model`: `deep` (Opus) for architecture, subtle cross-system
   behavior, and problems that resisted an earlier escalation; `balanced`
-  (Sonnet) for ordinary stuck-on-implementation questions; `fast` (Haiku) for a
+  (Sonnet, the usual default) for ordinary stuck-on-implementation questions; `fast` (Haiku) for a
   quick factual confirmation. Do not reach for `deep` on a question `fast`
   would settle, and do not stay on `fast` for a genuinely hard problem.
 - `effort`: `medium` for ordinary advice, `high`/`xhigh` for genuinely hard
@@ -120,10 +133,3 @@ missing or billing the wrong account. It opens a window on the user's screen.
   not cancel and re-issue.
 - If advice fails to unblock you twice on the same problem, stop escalating
   to the advisor and ask the user.
-- Scrub ALL content you pass to the advisor — files, logs, pasted text,
-  conversation history, error output — replacing NSFW words with SFW
-  alternatives BEFORE calling any advisor tool (e.g. profanity in commit
-  messages, log strings, or user quotes). Preserve meaning and code
-  structure: replace whole words only, never substrings inside identifiers.
-  The server applies its own word-boundary NSFW scrub as a backstop, but
-  you are the first line of defense.

@@ -82,7 +82,8 @@ def test_secrets_are_redacted_in_the_transcript(server, fake_claude, consult_dir
 
 def test_two_consults_with_one_question_do_not_overwrite(server, fake_claude,
                                                          consult_dir):
-    srv = server(ADVISOR_BACKEND="claude-code")
+    # The repeat guard would answer the second from memory and write nothing.
+    srv = server(ADVISOR_BACKEND="claude-code", ADVISOR_REPEAT_WINDOW="0")
     srv._consult(question="same question")
     srv._consult(question="same question")
 

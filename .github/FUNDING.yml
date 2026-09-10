@@ -1,0 +1,9 @@
+# GitHub shows a "Sponsor" button on the repo once any entry below is set.
+# Fill these in when the accounts exist, and set SUPPORT_URL in
+# wisdomtooth/server.py to the same page so it appears in the startup banner
+# and in saved transcripts (never in anything the agent reads).
+#
+# github: [H4l0B3nd3r]
+# ko_fi: your-handle
+# buy_me_a_coffee: your-handle
+# custom: ["https://example.com/donate"]
