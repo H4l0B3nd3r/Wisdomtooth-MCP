@@ -133,6 +133,36 @@ In `auto` mode only, a consult that fails because the plan's headless quota is
 exhausted retries on API credits (if a key exists) and says so loudly in the
 answer. Set `ADVISOR_FALLBACK_TO_API=0` to disable that.
 
+## Where the answer ends up
+
+Claude's answer comes back as an MCP tool result inside your agent's chat —
+which is somewhere this server does not control. Editors collapse the block,
+small local models paraphrase it into a summary, and a context trim eventually
+deletes it, so an answer you paid for can be genuinely hard to read back.
+
+So every consult is also written to a Markdown file:
+
+```
+~/.claude-advisor/consults/20260209-142233-ask-claude-why-does-the-datagrid-flicker.md
+```
+
+Each file holds exactly what was sent (after secret redaction), exactly what
+came back, and which account paid. The path reaches you two ways:
+
+- **In the answer footer**, as text — every client renders that, and the tool
+  description tells the agent to pass the path on to you.
+- **As a `resource_link` content block** marked `audience: ["user"]`, for
+  clients that turn one into something you can click.
+
+The newest 200 are kept and older ones are dropped. Turn the whole thing off
+with `ADVISOR_SAVE_CONSULTS=0`, or point it somewhere else with
+`ADVISOR_CONSULT_DIR`. `advisor_status` prints the directory in use.
+
+MCP gives a server no other way to put something in front of a person — there
+is no "open this panel" call, and `notifications/message` only moves the
+problem into the client's log pane. A file is the one channel that outlives
+the chat window.
+
 ## Configuration
 
 Five layers, highest priority first:
@@ -153,6 +183,9 @@ Five layers, highest priority first:
 | `ADVISOR_ANSWER_BUDGET` | `answer_budget` | `600` | Target answer length in words. Works on **both** backends; `0` disables. The only length control the subscription backend has |
 | `ADVISOR_MINIMAL_TOOLS` | `minimal_tools` | `0` | `1` advertises only `ask_claude` + `advisor_status`, cutting per-turn tool context from ~3340 to ~1090 tokens |
 | `ADVISOR_MAX_TOKENS` | `max_tokens` | `16000` | Answer cap, **API backend only** (the CLI has no such flag), max 128000 |
+| `ADVISOR_SAVE_CONSULTS` | `save_consults` | `1` | Write every answer to a Markdown file the user can open. `0` disables |
+| `ADVISOR_CONSULT_DIR` | `consult_dir` | `~/.claude-advisor/consults` | Where those files go |
+| `ADVISOR_CONSULT_KEEP` | `consult_keep` | `200` | Keep the newest N transcripts; `0` keeps everything |
 | `ADVISOR_TIMEOUT` | `timeout` | `180` | Seconds before a consult is killed |
 | `ADVISOR_LOCK` | `lock` | `0` | `1` pins model/effort/tokens |
 | `ADVISOR_TIERS_JSON` | `tiers` | — | Remap/extend tiers, e.g. `{"deep":"claude-fable-5-1"}` |
@@ -235,5 +268,9 @@ model/effort tier, and received a usable in-budget answer.
 - The prompt travels on **stdin** and the system prompt via
   `--system-prompt-file`, because Windows truncates a long or multi-line argv
   element when the CLI is an npm `.cmd` shim.
+- The consult tools return content blocks with no declared output schema.
+  Annotating that return type makes mcp 1.x derive a schema and echo every
+  block back a second time as structured JSON, while mcp 2.x suppresses it;
+  leaving the annotation off behaves identically on both SDK majors.
 - If you want the advisor to have its own tools (web search, file access), wrap
   Claude Code instead: `claude mcp serve`.

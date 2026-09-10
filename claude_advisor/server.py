@@ -16,6 +16,7 @@ Run:
 import asyncio
 import json
 import os
+import pathlib
 import re
 import shutil
 import subprocess
@@ -41,7 +42,7 @@ except ImportError:  # mcp 1.x
     from mcp.server.fastmcp.exceptions import ToolError as _ToolError
     _MCP_MAJOR = 1
 
-from mcp.types import ToolAnnotations
+from mcp.types import Annotations, ResourceLink, TextContent, ToolAnnotations
 
 
 class AdvisorError(_ToolError, RuntimeError):
@@ -109,6 +110,9 @@ CONFIG_KEYS = {
     "system_prompt_extra": "ADVISOR_SYSTEM_PROMPT_EXTRA",
     "answer_budget": "ADVISOR_ANSWER_BUDGET",
     "minimal_tools": "ADVISOR_MINIMAL_TOOLS",
+    "save_consults": "ADVISOR_SAVE_CONSULTS",
+    "consult_dir": "ADVISOR_CONSULT_DIR",
+    "consult_keep": "ADVISOR_CONSULT_KEEP",
 }
 
 
@@ -191,6 +195,16 @@ ANSWER_BUDGET = max(0, int(_setting("answer_budget", 600)))
 # tool-selection accuracy in small models.
 MINIMAL_TOOLS = _flag("minimal_tools", False)
 ESSENTIAL_TOOLS = ("ask_claude", "advisor_status")
+
+# Save every consult to a file the user can open. An MCP server cannot draw
+# anything in its client's window -- the tool result is the only thing it can
+# put in front of a human, and the client decides how, or whether, to render
+# it. Editors collapse it, a small local model paraphrases it away, and a
+# context trim eventually deletes it. A file survives all three.
+SAVE_CONSULTS = _flag("save_consults", True)
+# Keep the newest N transcripts, so an advisor in daily use does not grow a
+# directory forever. 0 keeps everything.
+CONSULT_KEEP = max(0, int(_setting("consult_keep", 200)))
 
 
 # ---------------------------------------------------------------------------
@@ -663,6 +677,136 @@ def _sanitize(text: str, scrub: bool = True) -> str:
     if scrub:
         text = _scrub_nsfw(text)
     return _truncate(text)
+
+
+# ---------------------------------------------------------------------------
+# Consult transcripts
+# ---------------------------------------------------------------------------
+# The advisor's answer reaches the user only as a tool result inside another
+# agent's chat -- somewhere this server does not control and cannot re-open.
+# So each consult is also written to a Markdown file, and that path travels
+# back two ways: inside the answer footer, which every client renders because
+# it is only text, and as a `resource_link` content block for the clients that
+# turn one into something clickable. What is saved is what was actually sent,
+# after secret redaction, so a transcript never becomes a second copy of a key
+# this server just declined to transmit. Disable with ADVISOR_SAVE_CONSULTS=0.
+
+CONSULT_SUFFIX = ".md"
+
+
+def _consult_dir() -> str:
+    """Where transcripts are written. Read per call rather than at import."""
+    return os.path.abspath(str(_setting("consult_dir") or os.path.join(
+        os.path.expanduser("~"), ".claude-advisor", "consults")))
+
+
+def _slug(text: str, limit: int = 48) -> str:
+    """A filename-safe stub of the question, so the directory can be skimmed.
+
+    Whitelist, not blacklist: this text comes from the caller and becomes part
+    of a path, so everything outside [a-z0-9-] is dropped rather than escaped.
+    Nothing that could act as a separator, a traversal, or a Windows reserved
+    character survives, and the timestamp prefix keeps the result from ever
+    being a bare device name like `con`.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "-", str(text).lower()).strip("-")
+    return slug[:limit].strip("-") or "consult"
+
+
+def _prune_consults(directory: str) -> None:
+    """Keep the newest CONSULT_KEEP transcripts. Best effort, never fatal."""
+    if not CONSULT_KEEP:
+        return
+    try:
+        paths = [os.path.join(directory, name) for name in os.listdir(directory)
+                 if name.endswith(CONSULT_SUFFIX)]
+        if len(paths) <= CONSULT_KEEP:
+            return
+        for stale in sorted(paths, key=os.path.getmtime,
+                            reverse=True)[CONSULT_KEEP:]:
+            os.remove(stale)
+    except OSError as exc:  # a racing or crowded directory is not an error
+        print("[claude-advisor] could not prune " + directory + ": " + str(exc),
+              file=sys.stderr)
+
+
+def _save_consult(kind: str, topic: str, sent: str, answer: str,
+                  footer: str) -> Optional[str]:
+    """Write one transcript; return its path, or None if nothing was written.
+
+    Never raises. A read-only home or a full disk costs the user a transcript,
+    which is a convenience -- it must not cost them the answer they just paid
+    for.
+    """
+    if not SAVE_CONSULTS:
+        return None
+    directory = _consult_dir()
+    stripped = topic.strip()
+    heading = stripped.splitlines()[0][:120] if stripped else kind
+    # The footer arrives as a rule plus the billing line; only the line is
+    # wanted here, and on one line, because it is rendered as inline code.
+    lines = [line for line in footer.splitlines() if line.strip("- ")]
+    body = (
+        "# " + kind + ": " + heading + "\n\n"
+        "*" + time.strftime("%Y-%m-%d %H:%M:%S") + " - claude-advisor "
+        + __version__ + "*\n\n"
+        "`" + (lines[-1].strip() if lines else "") + "`\n\n"
+        "## Sent to Claude\n\n" + sent + "\n\n"
+        "## Claude's answer\n\n" + answer + "\n")
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    try:
+        os.makedirs(directory, exist_ok=True)
+        # Two consults can land in the same second; "x" mode makes the loser of
+        # that race take the next name rather than overwrite the winner.
+        for attempt in range(1, 50):
+            tail = "" if attempt == 1 else "-" + str(attempt)
+            path = os.path.join(
+                directory,
+                stamp + "-" + _slug(kind, 24) + "-" + _slug(topic) + tail
+                + CONSULT_SUFFIX)
+            try:
+                with open(path, "x", encoding="utf-8") as fh:
+                    fh.write(body)
+                break
+            except FileExistsError:
+                continue
+        else:  # pragma: no cover - 49 collisions inside one second
+            return None
+    except OSError as exc:
+        print("[claude-advisor] could not save the consult transcript to "
+              + directory + ": " + str(exc), file=sys.stderr)
+        return None
+    _prune_consults(directory)
+    return path
+
+
+def _result_blocks(answer: str, saved: dict) -> list:
+    """The tool result: the answer as text, plus a link to its transcript.
+
+    Two blocks rather than one. The text is what the calling model reads and
+    what every client renders; the `resource_link` offers the same file to the
+    client as something it can put in front of the user directly, marked
+    `audience=["user"]` because that is exactly who it is for. A client that
+    ignores resource links loses nothing -- the path is in the footer too.
+
+    The return annotation is deliberately omitted, here and on the tools that
+    return this. Annotating a content-block list makes mcp 1.x derive an output
+    schema and echo every block back a second time as structured JSON, while
+    mcp 2.x suppresses the schema; leaving it off behaves identically on both.
+    """
+    blocks = [TextContent(type="text", text=answer)]
+    path = saved.get("path")
+    if path:
+        blocks.append(ResourceLink(
+            type="resource_link",
+            uri=pathlib.Path(path).as_uri(),
+            name=os.path.basename(path),
+            description="Claude's full answer, saved so the user can read it "
+                        "outside the chat",
+            mimeType="text/markdown",
+            annotations=Annotations(audience=["user"], priority=0.9),
+        ))
+    return blocks
 
 
 # ---------------------------------------------------------------------------
@@ -1222,8 +1366,17 @@ _NO_CREDENTIALS = (
 
 def _consult(question: str, context: str = "", extra_system: str = "",
              model: str = "", effort: str = "", max_tokens: int = 0,
-             scrub_context: bool = True) -> str:
-    """One stateless consult, on whichever backend is active."""
+             scrub_context: bool = True, kind: str = "consult",
+             saved: Optional[dict] = None) -> str:
+    """One stateless consult, on whichever backend is active.
+
+    `kind` names the calling tool, for the transcript. `saved` is an optional
+    out-parameter: pass a dict and the transcript path lands in it under
+    "path", so the tool wrapper can attach a `resource_link` to the same file.
+    An out-parameter rather than a richer return type because the answer string
+    IS this function's contract -- every caller, and most of the test suite,
+    treats it as one.
+    """
     system = (ADVISOR_SYSTEM_PROMPT + ("\n" + extra_system if extra_system else "")
               + _answer_budget_instruction())
     question = _scrub_nsfw(question)
@@ -1250,24 +1403,39 @@ def _consult(question: str, context: str = "", extra_system: str = "",
                     and _api_credentials_present()):
                 raise
             answer = _consult_api(system, user_content, model, effort, max_tokens)
-            return answer + (
+            footer = (
                 f"\n\n---\n[advisor: {model} · billed to API ACCOUNT "
                 "(pay-per-token) — the Claude subscription's headless usage "
                 "limit was exhausted, so this consult fell back to API credits. "
                 "Tell the user.]")
-        # The CLI has no max_tokens flag, so say so rather than let the caller
-        # believe a cap was applied.
-        note = (" · max_tokens ignored (not settable on this backend)"
-                if max_tokens and not LOCKED else "")
-        alias = _cli_model(model)
-        return answer + (
-            f"\n\n---\n[advisor: claude-code/{alias} · billed to SUBSCRIPTION"
-            + (f" · effort={effort}" if effort else "") + note + "]")
+        else:
+            # The CLI has no max_tokens flag, so say so rather than let the
+            # caller believe a cap was applied.
+            note = (" · max_tokens ignored (not settable on this backend)"
+                    if max_tokens and not LOCKED else "")
+            alias = _cli_model(model)
+            footer = (
+                f"\n\n---\n[advisor: claude-code/{alias} · billed to SUBSCRIPTION"
+                + (f" · effort={effort}" if effort else "") + note + "]")
+    else:
+        answer = _consult_api(system, user_content, model, effort, max_tokens)
+        footer = (f"\n\n---\n[advisor: {model} · billed to API ACCOUNT"
+                  + (f" · effort={effort}" if effort else "")
+                  + f" · max_tokens={_resolve_max_tokens(max_tokens)}]")
 
-    answer = _consult_api(system, user_content, model, effort, max_tokens)
-    return answer + (f"\n\n---\n[advisor: {model} · billed to API ACCOUNT"
-                     + (f" · effort={effort}" if effort else "")
-                     + f" · max_tokens={_resolve_max_tokens(max_tokens)}]")
+    path = _save_consult(kind, question, user_content, answer, footer)
+    if saved is not None:
+        saved["path"] = path
+    if path:
+        # In the footer rather than a block of its own: a client that renders
+        # nothing but text is the common case, and this is the line that tells
+        # the user their answer outlived the chat window.
+        # Backticked: clients render the footer as Markdown, and an unquoted
+        # Windows path loses its backslashes to escape processing.
+        footer += ("\n[saved: `" + path + "` — the full answer is in this file; "
+                   "give the user this path so they can read it outside the "
+                   "chat]")
+    return answer + footer
 
 
 # ---------------------------------------------------------------------------
@@ -1364,7 +1532,7 @@ def _model_catalogue() -> str:
 @tool(title="Ask Claude (escalation)", annotations=CONSULT_ANNOTATIONS)
 async def ask_claude(question: str, context: str, attempts_so_far: str,
                      model: str = "", effort: str = "",
-                     max_tokens: int = 0) -> str:
+                     max_tokens: int = 0):
     """ESCALATION: Ask Claude for expert advice when you are stuck.
 
     WHEN TO USE — only when BOTH conditions hold:
@@ -1405,20 +1573,24 @@ async def ask_claude(question: str, context: str, attempts_so_far: str,
             for a quick yes/no. Applies to the API backend only — the Claude
             Code CLI has no equivalent flag.
     """
-    return await asyncio.to_thread(
+    saved: dict = {}
+    answer = await asyncio.to_thread(
         _consult,
         question,
         context=f"{context}\n\n<attempts_so_far>\n{attempts_so_far}\n</attempts_so_far>",
         model=model,
         effort=effort,
         max_tokens=max_tokens,
+        kind="ask_claude",
+        saved=saved,
     )
+    return _result_blocks(answer, saved)
 
 
 @tool(title="Review code with Claude", annotations=CONSULT_ANNOTATIONS)
 async def review_code(code: str, concern: str = "general quality",
                       model: str = "", effort: str = "",
-                      max_tokens: int = 0) -> str:
+                      max_tokens: int = 0):
     """ESCALATION: Have Claude review code you are unsure about.
 
     WHEN TO USE: after implementing something non-trivial where you have
@@ -1438,7 +1610,8 @@ async def review_code(code: str, concern: str = "general quality",
         max_tokens: Cap the review length for this call (0 = configured
             default). Applies to the API backend only.
     """
-    return await asyncio.to_thread(
+    saved: dict = {}
+    answer = await asyncio.to_thread(
         _consult,
         question=f"Review this code with a focus on: {concern}. "
         "List concrete issues in priority order, with suggested fixes.",
@@ -1453,13 +1626,16 @@ async def review_code(code: str, concern: str = "general quality",
         # string-literal fix it suggested would not apply. Secrets are still
         # redacted.
         scrub_context=False,
+        kind="review_code",
+        saved=saved,
     )
+    return _result_blocks(answer, saved)
 
 
 @tool(title="Compare approaches with Claude", annotations=CONSULT_ANNOTATIONS)
 async def compare_approaches(problem: str, options: str, criteria: str = "",
                              model: str = "", effort: str = "",
-                             max_tokens: int = 0) -> str:
+                             max_tokens: int = 0):
     """ESCALATION: Have Claude compare approaches when you can't decide.
 
     WHEN TO USE: you have identified 2+ viable approaches to a non-trivial
@@ -1484,8 +1660,11 @@ async def compare_approaches(problem: str, options: str, criteria: str = "",
         + (f"\nDecision criteria: {criteria}\n" if criteria else "")
         + "\nCompare the tradeoffs briefly, then commit to a single recommendation."
     )
-    return await asyncio.to_thread(_consult, question, model=model, effort=effort,
-                                   max_tokens=max_tokens)
+    saved: dict = {}
+    answer = await asyncio.to_thread(_consult, question, model=model,
+                                     effort=effort, max_tokens=max_tokens,
+                                     kind="compare_approaches", saved=saved)
+    return _result_blocks(answer, saved)
 
 
 CREDENTIAL_ANNOTATIONS = ToolAnnotations(
@@ -1704,6 +1883,12 @@ def advisor_status() -> str:
                "NOT the Pro/Max subscription",
         "unavailable": "NONE — no usable credentials; run advisor_auth_check",
     }[backend]
+    if not SAVE_CONSULTS:
+        transcripts = "disabled (ADVISOR_SAVE_CONSULTS=0)"
+    elif CONSULT_KEEP:
+        transcripts = f"{_consult_dir()} (newest {CONSULT_KEEP} kept)"
+    else:
+        transcripts = f"{_consult_dir()} (all kept)"
     lines = [
         f"version: {__version__}",
         f"mcp sdk: {_MCP_MAJOR}.x",
@@ -1717,6 +1902,7 @@ def advisor_status() -> str:
         + ("" if _effective_answer_budget() else
            " (a long answer can overflow a small caller's context)"),
         f"tool surface: {'minimal (ask_claude, advisor_status)' if MINIMAL_TOOLS else 'full (10 tools)'}",
+        f"consult transcripts: {transcripts}",
         f"timeout: {TIMEOUT}s",
         f"per-call overrides: "
         f"{'LOCKED (env defaults always win)' if LOCKED else 'allowed'}",

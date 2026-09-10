@@ -177,10 +177,40 @@ Every answer ends with a line like:
 
 ```
 [advisor: claude-code/sonnet · billed to SUBSCRIPTION · effort=high]
+[saved: C:\Users\you\.claude-advisor\consults\20260209-142233-ask-claude-why-does-the-datagrid-flicker.md — ...]
 ```
 
-That is your audit trail. If it says `billed to API ACCOUNT`, you are spending
-per-token credits — check `advisor_status`.
+The first line is your audit trail. If it says `billed to API ACCOUNT`, you are
+spending per-token credits — check `advisor_status`.
+
+### Reading the answer yourself
+
+The second line is there because the answer arrives inside your *agent's* chat,
+not yours. Kilo and Cline do render an MCP tool result, but collapsed and easy
+to miss; a small local model will often paraphrase it into two sentences and
+move on; and once the conversation is trimmed the full text is gone. Digging it
+back out of your inference server's logs is not a workflow.
+
+So each consult is also written to a Markdown file holding what was sent (after
+secret redaction), what came back, and who paid:
+
+```
+~/.claude-advisor/consults/
+```
+
+Open the newest file to read the whole answer. Clients that render a
+`resource_link` — the second content block every consult returns — show it as
+something you can click instead.
+
+| Want to | Do |
+|---|---|
+| Find the directory | `advisor_status` prints it |
+| Move it | `ADVISOR_CONSULT_DIR=/some/path` |
+| Keep more or fewer | `ADVISOR_CONSULT_KEEP=1000` (`0` = keep all) |
+| Turn it off | `ADVISOR_SAVE_CONSULTS=0` |
+
+If your agent buries the answer, ask it for the `[saved: ...]` path — the tool
+result tells it to hand that over.
 
 ---
 
@@ -198,6 +228,7 @@ method, stored token, and whether anything is hijacking billing.
 | "usage limit is exhausted" | Plan's headless quota spent | Wait for reset, or add an API key and use `ADVISOR_BACKEND=auto` |
 | Consult times out | Not logged in, or a first-run prompt is blocking | Run `claude` interactively once, then `advisor_auth_check` |
 | Answers overflow the agent's context | Budget too high | Lower `ADVISOR_ANSWER_BUDGET` |
+| Can't find what Claude actually said | The agent summarised it | Open the newest file in `~/.claude-advisor/consults` (`advisor_status` prints the path) |
 | Agent escalates constantly | Rules file not installed | Copy `.kilocode/rules/claude-advisor.md` into the project |
 | Agent never escalates | It has not tried yet | Expected — the policy says escalate *after* its own attempts fail |
 | Command not found from a GUI editor | Reduced PATH | Use absolute paths, and set `ADVISOR_CLAUDE_BIN` |

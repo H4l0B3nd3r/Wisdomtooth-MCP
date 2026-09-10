@@ -71,6 +71,17 @@ If the user says something like "use Sonnet from now on" or "keep answers
 short", call `advisor_configure` rather than passing the same arguments on
 every call — it changes the default for the rest of the session.
 
+## Relaying the answer
+
+The user cannot see the advisor's reply the way you can, and it is expensive
+advice they paid for. After a consult:
+
+- If the answer's footer carries a `[saved: <path>]` line, give the user that
+  path. The full answer is in that file, and it survives context trimming.
+- Do not silently replace the answer with your own two-sentence summary. Say
+  what you are going to do with the advice, and point at the file for the rest.
+- If you disagree with the advice, say so and say why — but still surface it.
+
 ## Safety & discipline
 
 - Never paste credential files (.env, key files, kubeconfigs) into `context`.

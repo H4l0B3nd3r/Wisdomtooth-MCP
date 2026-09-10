@@ -3,6 +3,31 @@
 Ordered roughly by how likely they are to bite. "Fixed in code" items are
 handled automatically; the rest need awareness or config.
 
+## Fixed in code (0.7.0) — know they exist, don't re-break them
+
+00. **A tool result is the ONLY thing a server can put in front of a human,
+   and the client decides how to render it.** There is no "open a panel" call
+   in MCP; `notifications/message` only moves the text into the client's log
+   pane, and `annotations.audience` is a hint no client acts on today. Kilo and
+   Cline do render an MCP result, but collapsed — and a small local model will
+   often paraphrase it away before the user ever sees it. Hence the transcript
+   file in `~/.claude-advisor/consults/`, whose path is quoted in the answer
+   footer *and* attached as a `resource_link`. Deleting either half puts the
+   user back to reading answers out of their inference server's logs.
+
+00a. **Never annotate the consult tools' return type.** They return content
+   blocks. Declaring that (`-> list[ContentBlock]`, or anything similar) makes
+   mcp 1.x derive an output schema and echo every block back a second time as
+   structured JSON in `structuredContent`, while mcp 2.x suppresses the schema
+   — so the two SDK majors would disagree on the wire. An **unannotated**
+   return behaves identically on both. `tests/test_consult_log.py` pins this;
+   the check only means something when the suite is run against both venvs.
+
+00b. **The transcript stores what was sent, not what was passed in.** It is
+   written after `_sanitize`, so a key the server refused to transmit does not
+   get written to disk instead. If you ever move the write earlier, that
+   guarantee is gone.
+
 ## Fixed in code (0.4.0) — know they exist, don't re-break them
 
 0. **mcp 2.x renamed FastMCP.** `from mcp.server.fastmcp import FastMCP` raises

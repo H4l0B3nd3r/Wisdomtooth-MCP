@@ -1,5 +1,54 @@
 # AGENT-UPDATE.md — Migration playbook
 
+## 0.7.0 — the answer now outlives the chat window
+
+**Nothing to change; new behaviour is on by default.**
+
+Claude's answer came back as an MCP tool result and stopped there. That is a
+place this server does not control: editors collapse the block, a small local
+model paraphrases it into two sentences, and a context trim eventually deletes
+it. Users were reading answers out of their inference server's logs.
+
+1. **Every consult is now written to a Markdown file** in
+   `~/.claude-advisor/consults/`, named
+   `<timestamp>-<tool>-<question-slug>.md`. It holds what was sent (after the
+   same secret redaction that guards the wire), what came back, and which
+   account paid. The newest `ADVISOR_CONSULT_KEEP` (200) are kept.
+2. **The path travels back two ways.** A `[saved: ...]` line in the answer
+   footer, which every client renders because it is only text and which tells
+   the agent to hand the path to the user; and a `resource_link` content block
+   marked `audience: ["user"]`, for clients that render one as a link.
+3. **New settings:** `ADVISOR_SAVE_CONSULTS` (`0` disables the whole feature),
+   `ADVISOR_CONSULT_DIR`, `ADVISOR_CONSULT_KEEP`. `advisor_status` reports the
+   directory in use.
+
+### For agents calling this server
+
+`ask_claude`, `review_code` and `compare_approaches` now return **two content
+blocks** rather than one, and no longer declare an output schema. The answer
+text is unchanged and still the first block, so a client that reads text
+results needs no change. When the footer carries a `[saved: ...]` path, give
+that path to the user — it is the copy they can actually read.
+
+### Why no output schema
+
+Annotating the tools' return type as a content-block list makes mcp 1.x derive
+an output schema and echo every block back a second time as structured JSON,
+while mcp 2.x suppresses the schema entirely. An unannotated return behaves
+identically on both, which is what the cross-major test run pins.
+
+### Why a file at all
+
+MCP gives a server no way to draw in its client's window. The tool result is
+the only thing it can put in front of a person, and how that is rendered is the
+client's choice; `notifications/message` only moves the problem into the
+client's log pane. Surfacing an answer *inside* the chat UI as a first-class
+panel would need a change in Kilo/Cline themselves. A file is the one channel a
+server owns end to end.
+
+---
+
+
 ## 0.6.0 — sized for the actual caller (a local model)
 
 The consumer of this server is usually a small local model in a coding agent,

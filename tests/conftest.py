@@ -37,10 +37,13 @@ ADVISOR_ENV = tuple(sorted(set(_srv.CONFIG_KEYS.values()) | {
 }))
 
 
-# ADVISOR_CLAUDE_BIN is harness plumbing: `fake_claude` sets it and `no_claude`
-# clears it, both before the test body calls the factory. Wiping it here would
-# silently send every subprocess test at the real CLI.
-_PRESERVED = {"ADVISOR_CLAUDE_BIN"}
+# Harness plumbing, preserved across reloads. `fake_claude` sets
+# ADVISOR_CLAUDE_BIN and `no_claude` clears it, both before the test body calls
+# the factory; wiping it here would silently send every subprocess test at the
+# real CLI. ADVISOR_CONSULT_DIR is pinned to a temp directory by the autouse
+# `consult_dir` fixture below, and wiping it would scatter transcripts through
+# the developer's real ~/.claude-advisor.
+_PRESERVED = {"ADVISOR_CLAUDE_BIN", "ADVISOR_CONSULT_DIR"}
 
 
 def _reload(env: dict) -> object:
@@ -50,6 +53,20 @@ def _reload(env: dict) -> object:
     os.environ.update({k: str(v) for k, v in env.items()})
     import claude_advisor.server as mod
     return importlib.reload(mod)
+
+
+@pytest.fixture(autouse=True)
+def consult_dir(tmp_path, monkeypatch):
+    """Send consult transcripts to a temp directory, for every test.
+
+    Autouse and unconditional: a consult writes a transcript by default, so
+    without this any test that reaches `_consult` -- directly or over stdio --
+    would litter the developer's real home directory. Tests that care about
+    the transcripts read this path; the rest simply stay clean.
+    """
+    path = tmp_path / "consults"
+    monkeypatch.setenv("ADVISOR_CONSULT_DIR", str(path))
+    return path
 
 
 @pytest.fixture
