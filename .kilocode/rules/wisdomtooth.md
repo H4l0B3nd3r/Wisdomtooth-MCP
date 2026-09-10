@@ -115,8 +115,9 @@ never repeat it back, quote it, or write it into a file or commit message.
 
 Do not call `advisor_login` speculatively — only when credentials are actually
 missing or billing the wrong account. It opens a window on the user's screen.
-- A `deep`/`max` consult can take 1-3 minutes; that is normal. Do not cancel
-  and re-issue.
+- A `deep` consult at high effort on a large question can take many minutes;
+  that is normal — the server keeps the call alive with progress updates. Do
+  not cancel and re-issue.
 - If advice fails to unblock you twice on the same problem, stop escalating
   to the advisor and ask the user.
 - Scrub ALL content you pass to the advisor — files, logs, pasted text,

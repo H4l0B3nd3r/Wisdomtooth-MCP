@@ -114,7 +114,7 @@ handled automatically; the rest need awareness or config.
    edits it proposes against the real file.
 7. **Answers eaten by thinking.** On adaptive-thinking models, `max_tokens`
    covers thinking AND answer. At effort high/xhigh/max the server auto-raises
-   the ceiling (24k/32k/48k). If you see the "[advisor returned no visible
+   the ceiling (80k/96k/128k, above the 64k default). If you see the "[advisor returned no visible
    text...]" message, that guard fired — raise `ADVISOR_MAX_TOKENS` (or pass a
    larger per-call `max_tokens`) or lower effort.
 
@@ -249,9 +249,10 @@ handled automatically; the rest need awareness or config.
 14. **429/529 from the API backend.** Overloaded/rate-limit errors are
     transient. Policy: retry at most once, then report. No retry loops —
     each retry costs money.
-15. **`deep` + `max` latency.** An Opus consult at max effort can
-    legitimately take 1-3 minutes. That's expected, not a hang (hangs now
-    error out with diagnostics). Don't cancel it and re-issue — you pay for
+15. **`deep` + `max` latency.** An Opus consult at high effort on a large
+    question can legitimately take many minutes. That's expected, not a hang:
+    the kill timeout is sized to the consult (up to `ADVISOR_TIMEOUT_MAX`) and
+    progress heartbeats keep the client waiting. Don't cancel it and re-issue — you pay for
     the cancelled one too on the API backend.
 
 ## Testing the server by hand (don't create false negatives)
