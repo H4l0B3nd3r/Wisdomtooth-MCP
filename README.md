@@ -1,8 +1,15 @@
-# Claude Advisor MCP
+# Wisdomtooth MCP
 
 An MCP server that lets coding agents (Kilo Code, Cursor, Cline, Claude Code,
-custom agents) **escalate to Claude for advice when they are stuck** — one
-stateless call per question.
+custom agents) **escalate to a frontier model for advice when they are stuck**
+— one stateless call per question.
+
+**Claude is the model today, and stays the default.** The name is model-neutral
+on purpose — the backend layer is the seam where another provider (ChatGPT,
+Kimi, …) would slot in, and neither the tool surface nor the configuration
+assumes Anthropic. To be clear about what you get if you install it now:
+multi-provider support is *not implemented yet*, and every consult goes to
+Claude.
 
 By default it spends **your Claude subscription**, not API credits: consults go
 through the local Claude Code CLI, and the server only falls back to
@@ -17,9 +24,9 @@ actually follows it:
 
 1. **Tool descriptions** — every tool's MCP description begins with explicit
    WHEN TO USE / DO NOT USE criteria (agents always see these).
-2. **Required `attempts_so_far` argument** — `ask_claude` cannot be called
+2. **Required `attempts_so_far` argument** — `ask_wisdomtooth` cannot be called
    without stating what was already tried and what Context7/docs returned.
-3. **Kilo rules file** — `.kilocode/rules/claude-advisor.md` gives the agent
+3. **Kilo rules file** — `.kilocode/rules/wisdomtooth.md` gives the agent
    the full escalation policy as standing instructions.
 
 **New here?** Read `USAGE.md` — setup, tuning for local models, and
@@ -29,7 +36,7 @@ troubleshooting. This file is the reference.
 
 | Tool | Purpose |
 |---|---|
-| `ask_claude(question, context, attempts_so_far, [model, effort, max_tokens])` | Stuck on implementation or framework/platform/OS behavior after docs + attempts failed |
+| `ask_wisdomtooth(question, context, attempts_so_far, [model, effort, max_tokens])` | Stuck on implementation or framework/platform/OS behavior after docs + attempts failed |
 | `review_code(code, concern, [model, effort, max_tokens])` | Residual doubt about subtle or security-sensitive code just written |
 | `compare_approaches(problem, options, criteria, [model, effort, max_tokens])` | 2+ viable approaches, tradeoffs unclear after your own analysis |
 | `advisor_login(force, wait_seconds)` | Free. **Connects the user's Claude subscription over OAuth** — opens the sign-in on their desktop, waits, and switches billing over with no restart |
@@ -43,11 +50,11 @@ troubleshooting. This file is the reference.
 ## Install
 
 ```bash
-uv tool install /path/to/claude-advisor-mcp     # recommended
-# or: pipx install /path/to/claude-advisor-mcp
+uv tool install /path/to/wisdomtooth-mcp     # recommended
+# or: pipx install /path/to/wisdomtooth-mcp
 ```
 
-This puts a `claude-advisor-mcp` command on your PATH (stdio MCP server).
+This puts a `wisdomtooth-mcp` command on your PATH (stdio MCP server).
 
 **For subscription billing** (the default), install Claude Code:
 
@@ -76,7 +83,7 @@ claude setup-token               # prints a long-lived subscription token
 ```
 
 …then have your agent pass that token to `advisor_set_token`. The advisor
-stores it in `~/.claude-advisor/credentials.json` (owner-only) and injects it
+stores it in `~/.wisdomtooth/credentials.json` (owner-only) and injects it
 into every consult, so it survives restarts and reduced GUI environments
 without ever appearing in your MCP client's config.
 
@@ -85,25 +92,25 @@ without ever appearing in your MCP client's config.
 **Claude Code**
 
 ```bash
-claude mcp add claude-advisor -- claude-advisor-mcp
+claude mcp add wisdomtooth -- wisdomtooth-mcp
 ```
 
 **Kilo Code (current)** — merge `kilo-configs/kilo.subscription.jsonc` into your
 project's `kilo.jsonc` under the `mcp` key, or use Settings → MCP → Add Server →
-Local (stdio), command `claude-advisor-mcp`.
+Local (stdio), command `wisdomtooth-mcp`.
 
 **Kilo Code (classic)** — copy `kilo-configs/mcp.json` to `.kilocode/mcp.json`.
 
 **Cursor / Windsurf / Claude Desktop** — standard `mcpServers` JSON with command
-`claude-advisor-mcp`; same shape as `kilo-configs/mcp.json`.
+`wisdomtooth-mcp`; same shape as `kilo-configs/mcp.json`.
 
-**Escalation policy** — copy `.kilocode/rules/claude-advisor.md` into your
+**Escalation policy** — copy `.kilocode/rules/wisdomtooth.md` into your
 project's `.kilocode/rules/`. Kilo loads these as standing instructions, so the
 agent knows to try Context7 and its own fixes first.
 
-Tip: leave `ask_claude` **off** any auto-approve/`alwaysAllow` list at first.
-Seeing each escalation request tells you whether the agent is respecting the
-policy; auto-approve later if it behaves.
+Tip: leave `ask_wisdomtooth` **off** any auto-approve/`alwaysAllow` list at
+first. Seeing each escalation request tells you whether the agent is respecting
+the policy; auto-approve later if it behaves.
 
 ## Who gets billed
 
@@ -143,7 +150,7 @@ deletes it, so an answer you paid for can be genuinely hard to read back.
 So every consult is also written to a Markdown file:
 
 ```
-~/.claude-advisor/consults/20260209-142233-ask-claude-why-does-the-datagrid-flicker.md
+~/.wisdomtooth/consults/20260209-142233-ask-wisdomtooth-why-does-the-datagrid-flicker.md
 ```
 
 Each file holds exactly what was sent (after secret redaction), exactly what
@@ -170,7 +177,7 @@ Five layers, highest priority first:
 1. **Per-call tool arguments** — `model`, `effort`, `max_tokens`
 2. **Runtime overrides** — the `advisor_configure` tool, no restart required
 3. **Environment variables** — set by the MCP client, per server entry
-4. **A JSON config file** — `ADVISOR_CONFIG`, else `~/.claude-advisor/config.json`
+4. **A JSON config file** — `ADVISOR_CONFIG`, else `~/.wisdomtooth/config.json`
 5. **Built-in defaults**
 
 `ADVISOR_LOCK=1` freezes layers 3–5 and rejects 1–2, for hard cost control.
@@ -181,10 +188,10 @@ Five layers, highest priority first:
 | `ADVISOR_MODEL` | `model` | `balanced` | Tier alias or full model ID |
 | `ADVISOR_EFFORT` | `effort` | (API default) | `low`/`medium`/`high`/`xhigh`/`max` |
 | `ADVISOR_ANSWER_BUDGET` | `answer_budget` | `600` | Target answer length in words. Works on **both** backends; `0` disables. The only length control the subscription backend has |
-| `ADVISOR_MINIMAL_TOOLS` | `minimal_tools` | `0` | `1` advertises only `ask_claude` + `advisor_status`, cutting per-turn tool context from ~3340 to ~1090 tokens |
+| `ADVISOR_MINIMAL_TOOLS` | `minimal_tools` | `0` | `1` advertises only `ask_wisdomtooth` + `advisor_status`, cutting per-turn tool context from ~3340 to ~1090 tokens |
 | `ADVISOR_MAX_TOKENS` | `max_tokens` | `16000` | Answer cap, **API backend only** (the CLI has no such flag), max 128000 |
 | `ADVISOR_SAVE_CONSULTS` | `save_consults` | `1` | Write every answer to a Markdown file the user can open. `0` disables |
-| `ADVISOR_CONSULT_DIR` | `consult_dir` | `~/.claude-advisor/consults` | Where those files go |
+| `ADVISOR_CONSULT_DIR` | `consult_dir` | `~/.wisdomtooth/consults` | Where those files go |
 | `ADVISOR_CONSULT_KEEP` | `consult_keep` | `200` | Keep the newest N transcripts; `0` keeps everything |
 | `ADVISOR_TIMEOUT` | `timeout` | `180` | Seconds before a consult is killed |
 | `ADVISOR_LOCK` | `lock` | `0` | `1` pins model/effort/tokens |
@@ -200,9 +207,9 @@ Five layers, highest priority first:
 | `ADVISOR_TRANSPORT` | `transport` | `stdio` | `stdio` or `http` |
 | `ADVISOR_HOST` / `ADVISOR_PORT` | `host` / `port` | `127.0.0.1` / `8484` | HTTP transport bind |
 | `ANTHROPIC_API_KEY` | — | — | Only for the API backend |
-| `CLAUDE_CODE_OAUTH_TOKEN` | — | — | Durable headless subscription auth. Usually unnecessary — `advisor_login` / `advisor_set_token` store this for you in `~/.claude-advisor/credentials.json` |
+| `CLAUDE_CODE_OAUTH_TOKEN` | — | — | Durable headless subscription auth. Usually unnecessary — `advisor_login` / `advisor_set_token` store this for you in `~/.wisdomtooth/credentials.json` |
 
-Example `~/.claude-advisor/config.json`:
+Example `~/.wisdomtooth/config.json`:
 
 ```json
 {
@@ -251,7 +258,7 @@ anthropic 0.x and 1.x.
 
 It has also been driven end to end by a real local model (Qwen3.8-27B via
 LM Studio) using the same prompt assembly Kilo performs: the model escalated
-with `ask_claude`, populated all three required arguments, chose its own
+with `ask_wisdomtooth`, populated all three required arguments, chose its own
 model/effort tier, and received a usable in-budget answer.
 
 ## Design notes

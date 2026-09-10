@@ -10,6 +10,9 @@ Five layers, highest priority first:
 """
 
 import json
+import os
+
+from pathlib import Path
 
 import pytest
 
@@ -211,3 +214,73 @@ def test_model_catalogue_says_which_models_reject_effort(server):
     caps = text.split("MODEL CAPABILITIES")[1]
     haiku_line = next(l for l in caps.splitlines() if "claude-haiku-4-5" in l)
     assert "none" in haiku_line.lower()
+
+
+# --------------------------------------------------------------------------
+# The state directory (`_state_dir`)
+# --------------------------------------------------------------------------
+# 0.8.0 renamed `~/.claude-advisor` to `~/.wisdomtooth`. The stored OAuth token
+# lives there, so the rename must not orphan an existing install -- and the two
+# directories must never both be consulted, or a login in one becomes invisible
+# from the other.
+
+@pytest.fixture
+def fake_home(tmp_path, monkeypatch):
+    """Point `os.path.expanduser("~")` at a temp directory.
+
+    All three variables are set because ntpath prefers USERPROFILE while
+    posixpath reads HOME, and the suite runs on both.
+    """
+    for var in ("USERPROFILE", "HOME"):
+        monkeypatch.setenv(var, str(tmp_path))
+    monkeypatch.delenv("HOMEDRIVE", raising=False)
+    monkeypatch.delenv("HOMEPATH", raising=False)
+    assert os.path.expanduser("~") == str(tmp_path)
+    return tmp_path
+
+
+def test_state_dir_is_the_new_name_on_a_fresh_machine(server, fake_home):
+    assert server()._state_dir() == str(fake_home / ".wisdomtooth")
+
+
+def test_state_dir_keeps_the_legacy_directory_when_it_is_the_only_one(
+        server, fake_home):
+    """An upgrade must not sign the user out of a token stored under the old name."""
+    (fake_home / ".claude-advisor").mkdir()
+    assert server()._state_dir() == str(fake_home / ".claude-advisor")
+
+
+def test_state_dir_prefers_the_new_name_when_both_exist(server, fake_home):
+    (fake_home / ".claude-advisor").mkdir()
+    (fake_home / ".wisdomtooth").mkdir()
+    assert server()._state_dir() == str(fake_home / ".wisdomtooth")
+
+
+def test_every_home_path_goes_through_state_dir(server, fake_home, monkeypatch):
+    """A path that calls expanduser directly would split credentials in two."""
+    srv = server()
+    # Undo the autouse `consult_dir` pin, so `_consult_dir()` falls back to its
+    # default instead of the temp directory every other test wants.
+    monkeypatch.delenv("ADVISOR_CONSULT_DIR", raising=False)
+    root = srv._state_dir()
+    assert srv._credentials_path().startswith(root)
+    assert srv._consult_dir().startswith(root)
+    assert srv._workdir().startswith(root)
+    assert srv._system_prompt_file("x").startswith(root)
+    assert srv.DEFAULT_CONFIG_PATH.startswith(root)
+
+
+def test_state_dir_is_the_only_place_that_names_the_directory(server):
+    """The guard behind the test above: one call site, so the two can't diverge.
+
+    `_state_dir()` picking the legacy directory only helps if every reader
+    honours the choice. A path that joins the name itself would send half the
+    server to `~/.wisdomtooth` and half to `~/.claude-advisor`, which presents
+    as an unexplained logout. Asserting on the literals rather than on
+    `expanduser` because two other call sites legitimately expand `~` without
+    meaning this directory: the Anthropic SDK's `~/.config/anthropic`, and the
+    neutral fallback cwd for the CLI subprocess.
+    """
+    source = Path(server().__file__).read_text(encoding="utf-8")
+    assert source.count('".wisdomtooth"') == 1
+    assert source.count('".claude-advisor"') == 1

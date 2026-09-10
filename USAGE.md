@@ -1,4 +1,4 @@
-# Using Claude Advisor
+# Using Wisdomtooth
 
 A practical guide: what this is for, how to set it up, how to tune it, and what
 to do when it misbehaves. For the API-level reference see `README.md`; for the
@@ -10,7 +10,9 @@ sharp edges see `GOTCHAS.md`.
 
 Your local coding agent — a Qwen, Gemma, or similar model in Kilo Code, Cursor,
 or Cline — gets stuck. Instead of guessing from training data that may be a year
-old, it asks Claude one focused question and gets an expert answer back.
+old, it asks a frontier model one focused question and gets an expert answer
+back. That model is Claude today; the name is model-neutral because other
+providers are on the roadmap, but none are wired up yet.
 
 **It spends your Claude subscription, not API credits.** Consults run through
 your logged-in Claude Code CLI, so a Pro or Max plan covers them at no
@@ -21,9 +23,9 @@ called Claude for every question would be slow, would burn your plan's headless
 quota, and would stop thinking for itself. Three mechanisms hold that line:
 
 - Every tool description opens with explicit WHEN TO USE / DO NOT USE criteria.
-- `ask_claude` cannot be called without an `attempts_so_far` argument saying
-  what was already tried and what the docs returned.
-- `.kilocode/rules/claude-advisor.md` states the policy as a standing rule.
+- `ask_wisdomtooth` cannot be called without an `attempts_so_far` argument
+  saying what was already tried and what the docs returned.
+- `.kilocode/rules/wisdomtooth.md` states the policy as a standing rule.
 
 ---
 
@@ -32,7 +34,7 @@ quota, and would stop thinking for itself. Three mechanisms hold that line:
 ### 1. Install
 
 ```bash
-uv tool install /path/to/claude-advisor-mcp
+uv tool install /path/to/wisdomtooth-mcp
 ```
 
 You also need the Claude Code CLI on PATH — that is what talks to your
@@ -52,7 +54,7 @@ claude setup-token
 ```
 
 …and give the printed token to **`advisor_set_token`**. It is saved to
-`~/.claude-advisor/credentials.json` with owner-only permissions and injected
+`~/.wisdomtooth/credentials.json` with owner-only permissions and injected
 into every consult, so it survives restarts and the reduced environment a
 GUI-launched editor hands to its MCP servers.
 
@@ -63,9 +65,9 @@ GUI-launched editor hands to its MCP servers.
 ```jsonc
 {
   "mcp": {
-    "claude-advisor": {
+    "wisdomtooth": {
       "type": "local",
-      "command": ["claude-advisor-mcp"],
+      "command": ["wisdomtooth-mcp"],
       "environment": {
         "ADVISOR_BACKEND": "claude-code",
         "ADVISOR_MINIMAL_TOOLS": "1",
@@ -78,12 +80,12 @@ GUI-launched editor hands to its MCP servers.
 }
 ```
 
-**Claude Code** — `claude mcp add claude-advisor -- claude-advisor-mcp`
+**Claude Code** — `claude mcp add wisdomtooth -- wisdomtooth-mcp`
 
 **Cursor / Windsurf / Cline / Claude Desktop** — standard `mcpServers` JSON with
-command `claude-advisor-mcp`.
+command `wisdomtooth-mcp`.
 
-Then copy `.kilocode/rules/claude-advisor.md` into your project's
+Then copy `.kilocode/rules/wisdomtooth.md` into your project's
 `.kilocode/rules/` so the agent gets the escalation policy as a standing rule.
 
 Verify with **`advisor_status`**. You want `active backend: claude-code` and
@@ -106,10 +108,10 @@ turn**, not just when it escalates. Measured on this server:
 | Full | 10 | ~3,340 tokens | 41% |
 | Minimal | 2 | ~1,090 tokens | 13% |
 
-Minimal mode exposes only `ask_claude` and `advisor_status`. The operator tools
-still work — they are hidden from the model, not removed — you just turn the
-flag off for a session when you need them. A shorter tool list also measurably
-improves tool-selection accuracy in small models.
+Minimal mode exposes only `ask_wisdomtooth` and `advisor_status`. The operator
+tools still work — they are hidden from the model, not removed — you just turn
+the flag off for a session when you need them. A shorter tool list also
+measurably improves tool-selection accuracy in small models.
 
 **Recommended for any model under ~30B, or any context window under 32k.**
 
@@ -177,7 +179,7 @@ Every answer ends with a line like:
 
 ```
 [advisor: claude-code/sonnet · billed to SUBSCRIPTION · effort=high]
-[saved: C:\Users\you\.claude-advisor\consults\20260209-142233-ask-claude-why-does-the-datagrid-flicker.md — ...]
+[saved: C:\Users\you\.wisdomtooth\consults\20260209-142233-ask-wisdomtooth-why-does-the-datagrid-flicker.md — ...]
 ```
 
 The first line is your audit trail. If it says `billed to API ACCOUNT`, you are
@@ -195,7 +197,7 @@ So each consult is also written to a Markdown file holding what was sent (after
 secret redaction), what came back, and who paid:
 
 ```
-~/.claude-advisor/consults/
+~/.wisdomtooth/consults/
 ```
 
 Open the newest file to read the whole answer. Clients that render a
@@ -228,8 +230,8 @@ method, stored token, and whether anything is hijacking billing.
 | "usage limit is exhausted" | Plan's headless quota spent | Wait for reset, or add an API key and use `ADVISOR_BACKEND=auto` |
 | Consult times out | Not logged in, or a first-run prompt is blocking | Run `claude` interactively once, then `advisor_auth_check` |
 | Answers overflow the agent's context | Budget too high | Lower `ADVISOR_ANSWER_BUDGET` |
-| Can't find what Claude actually said | The agent summarised it | Open the newest file in `~/.claude-advisor/consults` (`advisor_status` prints the path) |
-| Agent escalates constantly | Rules file not installed | Copy `.kilocode/rules/claude-advisor.md` into the project |
+| Can't find what Claude actually said | The agent summarised it | Open the newest file in `~/.wisdomtooth/consults` (`advisor_status` prints the path) |
+| Agent escalates constantly | Rules file not installed | Copy `.kilocode/rules/wisdomtooth.md` into the project |
 | Agent never escalates | It has not tried yet | Expected — the policy says escalate *after* its own attempts fail |
 | Command not found from a GUI editor | Reduced PATH | Use absolute paths, and set `ADVISOR_CLAUDE_BIN` |
 

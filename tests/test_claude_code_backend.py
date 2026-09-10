@@ -5,6 +5,8 @@ spend -- and asserts on the exact argv, stdin, and environment the server hands
 to the child process.
 """
 
+import os
+
 import pytest
 
 
@@ -92,7 +94,12 @@ def test_runs_in_a_dedicated_workdir(server, fake_claude):
     """Otherwise the consult inherits the caller's CLAUDE.md and project state."""
     srv = server(ADVISOR_BACKEND="claude-code")
     consult(srv)
-    assert ".claude-advisor" in fake_claude.last["cwd"]
+    # Compared against `_workdir()` rather than a literal directory name: since
+    # 0.8.0 the state directory is `~/.wisdomtooth` on a fresh machine but the
+    # legacy `~/.claude-advisor` on one that predates the rename, and a test
+    # that pins the name passes or fails depending on whose home it runs in.
+    assert fake_claude.last["cwd"] == srv._workdir()
+    assert fake_claude.last["cwd"] != os.getcwd()
 
 
 # --------------------------------------------------------------------------

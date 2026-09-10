@@ -3,7 +3,7 @@
 // Two settings here exist because the consumer is a small model, and they are
 // the difference between this tool helping and hurting:
 //
-//   ADVISOR_MINIMAL_TOOLS  advertises only ask_claude + advisor_status.
+//   ADVISOR_MINIMAL_TOOLS  advertises only ask_wisdomtooth + advisor_status.
 //                          Tool schemas are charged against the local model's
 //                          context on EVERY turn: ~3340 tokens with all 10
 //                          tools, ~1090 with two. On an 8k window that is 41%
@@ -19,9 +19,9 @@
 //                          ADVISOR_MAX_TOKENS is API-backend only.
 {
   "mcp": {
-    "claude-advisor": {
+    "wisdomtooth": {
       "type": "local",
-      "command": ["claude-advisor-mcp"],
+      "command": ["wisdomtooth-mcp"],
       "environment": {
         // Subscription only. Never silently spends API credits.
         "ADVISOR_BACKEND": "claude-code",

@@ -1,8 +1,15 @@
-"""Claude Advisor MCP Server.
+"""Wisdomtooth MCP Server.
 
-Exposes Claude as an *escalation* advisor over MCP. Other agents (Kilo Code,
-Cursor, Cline, custom agents) call it when they are stuck -- after their own
-attempts and doc lookups (e.g. Context7) have not resolved the problem.
+Exposes a frontier model as an *escalation* advisor over MCP. Other agents
+(Kilo Code, Cursor, Cline, custom agents) call it when they are stuck -- after
+their own attempts and doc lookups (e.g. Context7) have not resolved the
+problem.
+
+Claude is the model behind it today and stays the default. The name is
+model-neutral on purpose: the backend layer (`_consult_claude_code`,
+`_consult_api`) is the seam another provider would slot into. Nothing in the
+tool surface assumes Anthropic -- but nothing else is implemented yet either,
+so every consult currently goes to Claude.
 
 Billing, in one line: by default the server uses the user's Claude
 subscription via the local Claude Code CLI, and only falls back to
@@ -10,7 +17,7 @@ pay-per-token API credits when the subscription is not usable. Every answer
 says which account paid for it.
 
 Run:
-    claude-advisor-mcp            # auto: subscription first, API as fallback
+    wisdomtooth-mcp            # auto: subscription first, API as fallback
 """
 
 import asyncio
@@ -68,7 +75,7 @@ class AdvisorInputError(AdvisorError, ValueError):
 
 try:
     from importlib.metadata import version as _pkg_version
-    __version__ = _pkg_version("claude-advisor-mcp")
+    __version__ = _pkg_version("wisdomtooth-mcp")
 except Exception:  # running from source without install
     __version__ = "0.4.0-dev"
 
@@ -80,13 +87,30 @@ except Exception:  # running from source without install
 #   1. per-call tool arguments        (model=, effort=, max_tokens=)
 #   2. runtime overrides              (the advisor_configure tool)
 #   3. environment variables          (ADVISOR_*, set by the MCP client)
-#   4. a JSON config file             (ADVISOR_CONFIG, else ~/.claude-advisor/
+#   4. a JSON config file             (ADVISOR_CONFIG, else ~/.wisdomtooth/
 #                                      config.json) -- machine-wide defaults
 #   5. built-in defaults
 # ADVISOR_LOCK=1 freezes layers 3-5 and rejects 1-2, for hard cost control.
 
-DEFAULT_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".claude-advisor",
-                                   "config.json")
+def _state_dir() -> str:
+    """The server's own directory under $HOME.
+
+    0.8.0 renamed it from `.claude-advisor` to `.wisdomtooth`. An install that
+    predates the rename keeps its stored OAuth token and config file, so the
+    old directory still wins when it is the only one present -- a rebrand must
+    not silently sign the user out. Every writer goes through here, so the two
+    never end up half-populated.
+    """
+    home = os.path.expanduser("~")
+    current = os.path.join(home, ".wisdomtooth")
+    if not os.path.isdir(current):
+        legacy = os.path.join(home, ".claude-advisor")
+        if os.path.isdir(legacy):
+            return legacy
+    return current
+
+
+DEFAULT_CONFIG_PATH = os.path.join(_state_dir(), "config.json")
 
 # Config-file key -> the environment variable that overrides it.
 CONFIG_KEYS = {
@@ -126,11 +150,11 @@ def _load_config_file() -> dict:
         if not isinstance(data, dict):
             raise ValueError("top level must be an object")  # caught just below
     except Exception as exc:  # a broken config must never stop the server
-        print(f"[claude-advisor] ignoring {path}: {exc}", file=sys.stderr)
+        print(f"[wisdomtooth] ignoring {path}: {exc}", file=sys.stderr)
         return {}
     unknown = set(data) - set(CONFIG_KEYS)
     if unknown:
-        print(f"[claude-advisor] unknown keys in {path}: {sorted(unknown)}",
+        print(f"[wisdomtooth] unknown keys in {path}: {sorted(unknown)}",
               file=sys.stderr)
     return data
 
@@ -189,12 +213,12 @@ MAX_BUDGET_USD = _setting("max_budget_usd")
 # 0 disables it, for callers with a large context window.
 ANSWER_BUDGET = max(0, int(_setting("answer_budget", 600)))
 
-# Expose only the tools an agent actually needs (`ask_claude`, `advisor_status`)
+# Expose only the tools an agent actually needs (`ask_wisdomtooth`, `advisor_status`)
 # and hide the operator tools. Every schema is charged against the calling
 # model's context on every turn, and a longer tool list measurably degrades
 # tool-selection accuracy in small models.
 MINIMAL_TOOLS = _flag("minimal_tools", False)
-ESSENTIAL_TOOLS = ("ask_claude", "advisor_status")
+ESSENTIAL_TOOLS = ("ask_wisdomtooth", "advisor_status")
 
 # Save every consult to a file the user can open. An MCP server cannot draw
 # anything in its client's window -- the tool result is the only thing it can
@@ -228,7 +252,7 @@ def _apply_tier_overrides() -> None:
         custom = raw if isinstance(raw, dict) else json.loads(raw)
         MODEL_TIERS.update({str(k).lower(): str(v) for k, v in custom.items()})
     except Exception as exc:
-        print(f"[claude-advisor] ignoring tier overrides: {exc}", file=sys.stderr)
+        print(f"[wisdomtooth] ignoring tier overrides: {exc}", file=sys.stderr)
 
 
 _apply_tier_overrides()
@@ -425,7 +449,7 @@ def _build_system_prompt() -> str:
             with open(path, encoding="utf-8") as fh:
                 prompt = fh.read()
         except Exception as exc:
-            print(f"[claude-advisor] ignoring system prompt file {path}: {exc}",
+            print(f"[wisdomtooth] ignoring system prompt file {path}: {exc}",
                   file=sys.stderr)
     inline = _setting("system_prompt")
     if inline:
@@ -453,7 +477,7 @@ ALWAYS include in `context`: what you tried, exact errors, and what the docs
 said -- the advisor is stateless and sees nothing else.
 """
 
-_server_kwargs = dict(name="claude-advisor", instructions=WHEN_TO_USE)
+_server_kwargs = dict(name="wisdomtooth", instructions=WHEN_TO_USE)
 if _MCP_MAJOR >= 2:
     _server_kwargs["version"] = __version__
 mcp = _ServerClass(**_server_kwargs)
@@ -515,8 +539,7 @@ def _api_credentials_present() -> bool:
 # the MCP client's JSON followed by a server restart.
 
 def _credentials_path() -> str:
-    return os.path.join(os.path.expanduser("~"), ".claude-advisor",
-                        "credentials.json")
+    return os.path.join(_state_dir(), "credentials.json")
 
 
 def _read_credentials() -> dict:
@@ -528,7 +551,7 @@ def _read_credentials() -> dict:
             data = json.load(fh)
         return data if isinstance(data, dict) else {}
     except Exception as exc:  # a broken store must never stop the server
-        print(f"[claude-advisor] ignoring {path}: {exc}", file=sys.stderr)
+        print(f"[wisdomtooth] ignoring {path}: {exc}", file=sys.stderr)
         return {}
 
 
@@ -629,7 +652,7 @@ def _load_nsfw_map() -> dict:
             with open(extra, encoding="utf-8") as fh:
                 mapping.update({str(k).lower(): str(v) for k, v in json.load(fh).items()})
         except Exception as exc:  # a bad user file must not kill the server
-            print(f"[claude-advisor] ignoring ADVISOR_NSFW_EXTRA_JSON: {exc}",
+            print(f"[wisdomtooth] ignoring ADVISOR_NSFW_EXTRA_JSON: {exc}",
                   file=sys.stderr)
     return mapping
 
@@ -696,8 +719,8 @@ CONSULT_SUFFIX = ".md"
 
 def _consult_dir() -> str:
     """Where transcripts are written. Read per call rather than at import."""
-    return os.path.abspath(str(_setting("consult_dir") or os.path.join(
-        os.path.expanduser("~"), ".claude-advisor", "consults")))
+    return os.path.abspath(str(_setting("consult_dir")
+                               or os.path.join(_state_dir(), "consults")))
 
 
 def _slug(text: str, limit: int = 48) -> str:
@@ -726,7 +749,7 @@ def _prune_consults(directory: str) -> None:
                             reverse=True)[CONSULT_KEEP:]:
             os.remove(stale)
     except OSError as exc:  # a racing or crowded directory is not an error
-        print("[claude-advisor] could not prune " + directory + ": " + str(exc),
+        print("[wisdomtooth] could not prune " + directory + ": " + str(exc),
               file=sys.stderr)
 
 
@@ -748,7 +771,7 @@ def _save_consult(kind: str, topic: str, sent: str, answer: str,
     lines = [line for line in footer.splitlines() if line.strip("- ")]
     body = (
         "# " + kind + ": " + heading + "\n\n"
-        "*" + time.strftime("%Y-%m-%d %H:%M:%S") + " - claude-advisor "
+        "*" + time.strftime("%Y-%m-%d %H:%M:%S") + " - wisdomtooth "
         + __version__ + "*\n\n"
         "`" + (lines[-1].strip() if lines else "") + "`\n\n"
         "## Sent to Claude\n\n" + sent + "\n\n"
@@ -773,7 +796,7 @@ def _save_consult(kind: str, topic: str, sent: str, answer: str,
         else:  # pragma: no cover - 49 collisions inside one second
             return None
     except OSError as exc:
-        print("[claude-advisor] could not save the consult transcript to "
+        print("[wisdomtooth] could not save the consult transcript to "
               + directory + ": " + str(exc), file=sys.stderr)
         return None
     _prune_consults(directory)
@@ -902,7 +925,7 @@ def _cli_features(claude_bin: str) -> set:
         if "--system-prompt-file" in text or "--system-prompt[-file]" in text:
             flags.add("--system-prompt-file")
     except Exception as exc:  # a failed probe must not block the consult
-        print(f"[claude-advisor] could not probe `claude --help`: {exc}",
+        print(f"[wisdomtooth] could not probe `claude --help`: {exc}",
               file=sys.stderr)
     _FEATURE_CACHE[claude_bin] = flags
     return flags
@@ -934,8 +957,7 @@ def _system_prompt_file(system: str) -> str:
     Rewritten per consult because `extra_system` differs by tool, and kept out
     of the workdir itself so the CLI never sees it as project content.
     """
-    path = os.path.join(os.path.expanduser("~"), ".claude-advisor",
-                        "system-prompt.txt")
+    path = os.path.join(_state_dir(), "system-prompt.txt")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(system)
@@ -948,7 +970,7 @@ def _workdir() -> str:
     Keeps Claude Code from loading CLAUDE.md and project state from whatever
     cwd the MCP client happened to use, and avoids first-run trust prompts.
     """
-    path = os.path.join(os.path.expanduser("~"), ".claude-advisor", "workdir")
+    path = os.path.join(_state_dir(), "workdir")
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -1529,11 +1551,11 @@ def _model_catalogue() -> str:
 # Tools
 # ---------------------------------------------------------------------------
 
-@tool(title="Ask Claude (escalation)", annotations=CONSULT_ANNOTATIONS)
-async def ask_claude(question: str, context: str, attempts_so_far: str,
-                     model: str = "", effort: str = "",
-                     max_tokens: int = 0):
-    """ESCALATION: Ask Claude for expert advice when you are stuck.
+@tool(title="Ask Wisdomtooth (escalation)", annotations=CONSULT_ANNOTATIONS)
+async def ask_wisdomtooth(question: str, context: str, attempts_so_far: str,
+                          model: str = "", effort: str = "",
+                          max_tokens: int = 0):
+    """ESCALATION: Ask Wisdomtooth for expert advice when you are stuck.
 
     WHEN TO USE — only when BOTH conditions hold:
     (a) You are having difficulty implementing code or understanding a
@@ -1581,7 +1603,7 @@ async def ask_claude(question: str, context: str, attempts_so_far: str,
         model=model,
         effort=effort,
         max_tokens=max_tokens,
-        kind="ask_claude",
+        kind="ask_wisdomtooth",
         saved=saved,
     )
     return _result_blocks(answer, saved)
@@ -1901,7 +1923,7 @@ def advisor_status() -> str:
         f"answer budget: {_effective_answer_budget() or 'unlimited'} words"
         + ("" if _effective_answer_budget() else
            " (a long answer can overflow a small caller's context)"),
-        f"tool surface: {'minimal (ask_claude, advisor_status)' if MINIMAL_TOOLS else 'full (10 tools)'}",
+        f"tool surface: {'minimal (ask_wisdomtooth, advisor_status)' if MINIMAL_TOOLS else 'full (10 tools)'}",
         f"consult transcripts: {transcripts}",
         f"timeout: {TIMEOUT}s",
         f"per-call overrides: "
@@ -1924,15 +1946,15 @@ def advisor_status() -> str:
 def _billing_banner() -> str:
     backend = _active_backend()
     if backend == "claude-code":
-        return (f"[claude-advisor v{__version__}] backend={backend} → consults run "
+        return (f"[wisdomtooth v{__version__}] backend={backend} → consults run "
                 "through the local Claude Code CLI and bill your Claude "
                 "SUBSCRIPTION (Pro/Max). ANTHROPIC_API_KEY is stripped from the "
                 "subprocess so it cannot silently switch to API billing.")
     if backend == "api":
-        return (f"[claude-advisor v{__version__}] backend={backend} → consults use "
+        return (f"[wisdomtooth v{__version__}] backend={backend} → consults use "
                 "ANTHROPIC_API_KEY and bill your DEVELOPER CONSOLE account per "
                 "token (NOT your Pro/Max subscription).")
-    return (f"[claude-advisor v{__version__}] no usable credentials — every "
+    return (f"[wisdomtooth v{__version__}] no usable credentials — every "
             "consult will fail until you log in Claude Code (`claude` → "
             "`/login`) or set ANTHROPIC_API_KEY. Run advisor_auth_check.")
 

@@ -6,18 +6,18 @@
 {
   "mcp": {
     // Option A: Kilo launches a throwaway container per session (stdio)
-    "claude-advisor": {
+    "wisdomtooth": {
       "type": "local",
-      "command": ["docker", "run", "-i", "--rm", "-e", "ANTHROPIC_API_KEY", "claude-advisor-mcp"],
+      "command": ["docker", "run", "-i", "--rm", "-e", "ANTHROPIC_API_KEY", "wisdomtooth-mcp"],
       "environment": { "ADVISOR_BACKEND": "api", "ANTHROPIC_API_KEY": "sk-ant-your-key-here" },
       "enabled": true,
       "timeout": 300000
     }
     // Option B: persistent container, remote transport. First run:
-    //   docker run -d --name claude-advisor -p 8484:8484 \
+    //   docker run -d --name wisdomtooth -p 8484:8484 \
     //     -e ADVISOR_BACKEND=api -e ANTHROPIC_API_KEY=sk-ant-... -e ADVISOR_TRANSPORT=http \
-    //     -e ADVISOR_HOST=0.0.0.0 claude-advisor-mcp
+    //     -e ADVISOR_HOST=0.0.0.0 wisdomtooth-mcp
     // then use:
-    // "claude-advisor": { "type": "remote", "url": "http://localhost:8484/mcp", "enabled": true }
+    // "wisdomtooth": { "type": "remote", "url": "http://localhost:8484/mcp", "enabled": true }
   }
 }

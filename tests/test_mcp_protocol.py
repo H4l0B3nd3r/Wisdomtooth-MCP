@@ -16,7 +16,7 @@ from mcp.client.stdio import stdio_client
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
 
-EXPECTED_TOOLS = {"ask_claude", "review_code", "compare_approaches",
+EXPECTED_TOOLS = {"ask_wisdomtooth", "review_code", "compare_approaches",
                   "advisor_status", "advisor_auth_check", "advisor_models",
                   "advisor_configure", "advisor_login", "advisor_set_token",
                   "advisor_logout"}
@@ -34,7 +34,7 @@ def _params(**env):
     child.update(env)
     return StdioServerParameters(
         command=sys.executable,
-        args=["-c", "from claude_advisor.server import main; main()"],
+        args=["-c", "from wisdomtooth.server import main; main()"],
         env=child,
     )
 
@@ -83,7 +83,7 @@ async def test_server_initializes(fake_claude):
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             result = await session.initialize()
-            assert field(result, "serverInfo", "server_info").name == "claude-advisor"
+            assert field(result, "serverInfo", "server_info").name == "wisdomtooth"
             assert field(result, "protocolVersion", "protocol_version")
 
 
@@ -104,7 +104,7 @@ async def test_consulting_tools_are_annotated_read_only(fake_claude):
     """Clients use annotations to decide what needs an approval prompt."""
     async with advisor_session(fake_claude) as session:
         tools = {t.name: t for t in (await session.list_tools()).tools}
-        for name in ("ask_claude", "review_code", "compare_approaches"):
+        for name in ("ask_wisdomtooth", "review_code", "compare_approaches"):
             assert tools[name].annotations is not None, name
             ann = tools[name].annotations
             assert field(ann, "readOnlyHint", "read_only_hint") is True, name
@@ -122,7 +122,7 @@ async def test_escalation_policy_is_in_the_server_instructions(fake_claude):
 async def test_required_arguments_are_declared(fake_claude):
     async with advisor_session(fake_claude) as session:
         tools = {t.name: t for t in (await session.list_tools()).tools}
-        schema = field(tools["ask_claude"], "inputSchema", "input_schema")
+        schema = field(tools["ask_wisdomtooth"], "inputSchema", "input_schema")
         required = set(schema.get("required", []))
         assert {"question", "context", "attempts_so_far"} <= required
 
@@ -131,9 +131,9 @@ async def test_required_arguments_are_declared(fake_claude):
 # Calling the tools
 # --------------------------------------------------------------------------
 
-async def test_ask_claude_returns_an_answer(fake_claude):
+async def test_ask_wisdomtooth_returns_an_answer(fake_claude):
     async with advisor_session(fake_claude) as session:
-        result, text = await _call(session, "ask_claude", {
+        result, text = await _call(session, "ask_wisdomtooth", {
             "question": "why does the build fail?",
             "context": "cargo build, linker error LNK2019",
             "attempts_so_far": "read the docs, cleaned target/",
@@ -142,9 +142,9 @@ async def test_ask_claude_returns_an_answer(fake_claude):
         assert "FAKE ANSWER" in text
 
 
-async def test_ask_claude_forwards_all_three_required_fields(fake_claude):
+async def test_ask_wisdomtooth_forwards_all_three_required_fields(fake_claude):
     async with advisor_session(fake_claude) as session:
-        await _call(session, "ask_claude", {
+        await _call(session, "ask_wisdomtooth", {
             "question": "QQQ", "context": "CCC", "attempts_so_far": "AAA"})
         prompt = fake_claude.last["prompt"]
         assert "QQQ" in prompt and "CCC" in prompt and "AAA" in prompt
@@ -167,7 +167,7 @@ async def test_compare_approaches_works(fake_claude):
 
 async def test_missing_required_argument_is_an_error(fake_claude):
     async with advisor_session(fake_claude) as session:
-        result = await session.call_tool("ask_claude", {"question": "q"})
+        result = await session.call_tool("ask_wisdomtooth", {"question": "q"})
         assert field(result, "isError", "is_error") is True
 
 
@@ -192,7 +192,7 @@ async def test_a_backend_failure_is_returned_as_a_tool_error(
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            result = await session.call_tool("ask_claude", {
+            result = await session.call_tool("ask_wisdomtooth", {
                 "question": "q", "context": "c", "attempts_so_far": "a"})
             assert field(result, "isError", "is_error") is True
 
@@ -215,7 +215,7 @@ async def test_server_answers_other_requests_during_a_slow_consult(fake_claude):
             async with anyio.create_task_group() as tg:
                 async def slow():
                     with anyio.move_on_after(10):
-                        await session.call_tool("ask_claude", {
+                        await session.call_tool("ask_wisdomtooth", {
                             "question": "q", "context": "c",
                             "attempts_so_far": "a"})
 
@@ -254,7 +254,7 @@ async def test_configure_rejections_keep_their_guidance(fake_claude):
 async def test_backend_failures_keep_their_diagnostics(fake_claude):
     """An auth failure's login instructions are the entire value of the error."""
     async with advisor_session(fake_claude, FAKE_CLAUDE_MODE="auth_fail") as s:
-        result, text = await _call(s, "ask_claude", {
+        result, text = await _call(s, "ask_wisdomtooth", {
             "question": "q", "context": "c", "attempts_so_far": "a"})
         assert field(result, "isError", "is_error") is True
         assert "/login" in text
@@ -264,7 +264,7 @@ async def test_backend_failures_keep_their_diagnostics(fake_claude):
 # Minimal tool surface, for small-context local models
 # --------------------------------------------------------------------------
 
-ESSENTIAL_TOOLS = {"ask_claude", "advisor_status"}
+ESSENTIAL_TOOLS = {"ask_wisdomtooth", "advisor_status"}
 
 
 async def test_minimal_mode_hides_the_admin_tools(fake_claude):
@@ -278,7 +278,7 @@ async def test_minimal_mode_hides_the_admin_tools(fake_claude):
 
 async def test_minimal_mode_still_consults(fake_claude):
     async with advisor_session(fake_claude, ADVISOR_MINIMAL_TOOLS="1") as s:
-        result, text = await _call(s, "ask_claude", {
+        result, text = await _call(s, "ask_wisdomtooth", {
             "question": "q", "context": "c", "attempts_so_far": "a"})
         assert field(result, "isError", "is_error") is not True
         assert "FAKE ANSWER" in text

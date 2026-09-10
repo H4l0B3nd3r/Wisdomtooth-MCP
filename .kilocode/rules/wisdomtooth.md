@@ -1,11 +1,11 @@
-# Claude Advisor — Escalation Policy
+# Wisdomtooth — Escalation Policy
 
-This project has the `claude-advisor` MCP server available. It consults an
+This project has the `wisdomtooth` MCP server available. It consults an
 expert Claude model for a second opinion. Every use spends the user's Claude
 subscription quota (or, if configured that way, their API credits), so treat it
 as an **escalation path, not a first resort**.
 
-## When to use `ask_claude`
+## When to use `ask_wisdomtooth`
 
 Use it when **both** of these are true:
 

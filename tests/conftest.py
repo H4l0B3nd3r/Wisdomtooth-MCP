@@ -28,7 +28,7 @@ import pytest
 # change an outcome. Derived from the server's own config table rather than
 # hand-listed: a new setting would otherwise silently leak between tests, which
 # is exactly the bug this list exists to prevent.
-import claude_advisor.server as _srv  # noqa: E402
+import wisdomtooth.server as _srv  # noqa: E402
 
 ADVISOR_ENV = tuple(sorted(set(_srv.CONFIG_KEYS.values()) | {
     "ADVISOR_KEEP_AUTH_ENV", "ADVISOR_NO_STRICT_MCP", "ADVISOR_NSFW_EXTRA_JSON",
@@ -42,7 +42,7 @@ ADVISOR_ENV = tuple(sorted(set(_srv.CONFIG_KEYS.values()) | {
 # the factory; wiping it here would silently send every subprocess test at the
 # real CLI. ADVISOR_CONSULT_DIR is pinned to a temp directory by the autouse
 # `consult_dir` fixture below, and wiping it would scatter transcripts through
-# the developer's real ~/.claude-advisor.
+# the developer's real ~/.wisdomtooth.
 _PRESERVED = {"ADVISOR_CLAUDE_BIN", "ADVISOR_CONSULT_DIR"}
 
 
@@ -51,7 +51,7 @@ def _reload(env: dict) -> object:
         if key not in _PRESERVED:
             os.environ.pop(key, None)
     os.environ.update({k: str(v) for k, v in env.items()})
-    import claude_advisor.server as mod
+    import wisdomtooth.server as mod
     return importlib.reload(mod)
 
 
@@ -71,7 +71,7 @@ def consult_dir(tmp_path, monkeypatch):
 
 @pytest.fixture
 def server():
-    """Reload `claude_advisor.server` under a chosen environment.
+    """Reload `wisdomtooth.server` under a chosen environment.
 
     Usage: `srv = server(ADVISOR_BACKEND="api", ANTHROPIC_API_KEY="k")`.
     """
@@ -87,7 +87,7 @@ def server():
             os.environ.pop(key, None)
         else:
             os.environ[key] = value
-    importlib.reload(importlib.import_module("claude_advisor.server"))
+    importlib.reload(importlib.import_module("wisdomtooth.server"))
 
 
 # --------------------------------------------------------------------------

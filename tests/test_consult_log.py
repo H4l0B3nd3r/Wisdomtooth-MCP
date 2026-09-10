@@ -34,7 +34,7 @@ def _audience(annotations) -> list:
 def test_a_consult_writes_a_transcript(server, fake_claude, consult_dir):
     srv = server(ADVISOR_BACKEND="claude-code")
     answer = srv._consult(question="WHY-IS-THE-BUILD-RED", context="CTX-BODY",
-                          kind="ask_claude")
+                          kind="ask_wisdomtooth")
 
     files = list(consult_dir.glob("*.md"))
     assert len(files) == 1
@@ -50,10 +50,10 @@ def test_a_consult_writes_a_transcript(server, fake_claude, consult_dir):
 def test_the_filename_carries_the_tool_and_the_question(server, fake_claude,
                                                         consult_dir):
     srv = server(ADVISOR_BACKEND="claude-code")
-    srv._consult(question="Why does the DataGrid flicker?", kind="ask_claude")
+    srv._consult(question="Why does the DataGrid flicker?", kind="ask_wisdomtooth")
 
     name = next(consult_dir.glob("*.md")).name
-    assert "ask-claude" in name
+    assert "ask-wisdomtooth" in name
     assert "why-does-the-datagrid-flicker" in name
 
 
@@ -61,7 +61,7 @@ def test_a_hostile_question_cannot_escape_the_directory(server, fake_claude,
                                                         consult_dir):
     srv = server(ADVISOR_BACKEND="claude-code")
     srv._consult(question="../../../../etc/passwd C:\\Windows\\system32 <>|",
-                 kind="ask_claude")
+                 kind="ask_wisdomtooth")
 
     written = list(consult_dir.glob("*.md"))
     assert len(written) == 1
@@ -152,9 +152,9 @@ def test_status_reports_where_transcripts_go(server, fake_claude, consult_dir):
 # What the client actually receives
 # --------------------------------------------------------------------------
 
-async def test_ask_claude_returns_a_resource_link_beside_the_answer(fake_claude):
+async def test_ask_wisdomtooth_returns_a_resource_link_beside_the_answer(fake_claude):
     async with advisor_session(fake_claude) as session:
-        result, text = await _call(session, "ask_claude", {
+        result, text = await _call(session, "ask_wisdomtooth", {
             "question": "why is it broken",
             "context": "some code",
             "attempts_so_far": "read the docs",
@@ -175,7 +175,7 @@ async def test_ask_claude_returns_a_resource_link_beside_the_answer(fake_claude)
 
 async def test_every_consult_tool_links_its_transcript(fake_claude):
     calls = {
-        "ask_claude": {"question": "q", "context": "c", "attempts_so_far": "a"},
+        "ask_wisdomtooth": {"question": "q", "context": "c", "attempts_so_far": "a"},
         "review_code": {"code": "print(1)", "concern": "security"},
         "compare_approaches": {"problem": "p", "options": "a\nb"},
     }
@@ -198,7 +198,7 @@ async def test_a_consult_tool_advertises_no_output_schema(fake_claude):
     async with advisor_session(fake_claude) as session:
         tools = {t.name: t for t in (await session.list_tools()).tools}
 
-    for name in ("ask_claude", "review_code", "compare_approaches"):
+    for name in ("ask_wisdomtooth", "review_code", "compare_approaches"):
         schema = getattr(tools[name], "outputSchema", None) or getattr(
             tools[name], "output_schema", None)
         assert schema is None, f"{name} advertises {schema}"
@@ -206,7 +206,7 @@ async def test_a_consult_tool_advertises_no_output_schema(fake_claude):
 
 async def test_no_resource_link_when_saving_is_off(fake_claude):
     async with advisor_session(fake_claude, ADVISOR_SAVE_CONSULTS="0") as session:
-        result, text = await _call(session, "ask_claude", {
+        result, text = await _call(session, "ask_wisdomtooth", {
             "question": "q", "context": "c", "attempts_so_far": "a",
         })
 

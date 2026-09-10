@@ -1,5 +1,70 @@
 # AGENT-UPDATE.md — Migration playbook
 
+## 0.8.0 — renamed to Wisdomtooth
+
+**One breaking change: the `ask_claude` tool is now `ask_wisdomtooth`.**
+
+The project was called Claude Advisor because Claude is what it consults. That
+name is a dead end for a tool meant to be provider-agnostic, so the product is
+now **Wisdomtooth MCP**. Claude remains the model and the default; only the
+branding moved.
+
+### What changed
+
+| Was | Is |
+|---|---|
+| tool `ask_claude` | tool `ask_wisdomtooth` |
+| package `claude_advisor` | package `wisdomtooth` |
+| distribution / command `claude-advisor-mcp` | `wisdomtooth-mcp` |
+| MCP server name `claude-advisor` | `wisdomtooth` |
+| rules file `.kilocode/rules/claude-advisor.md` | `.kilocode/rules/wisdomtooth.md` |
+| state directory `~/.claude-advisor/` | `~/.wisdomtooth/` |
+
+### What did NOT change
+
+- **Every `ADVISOR_*` environment variable.** `ADVISOR_BACKEND`,
+  `ADVISOR_MODEL`, `ADVISOR_MINIMAL_TOOLS` and the rest keep their names. An
+  existing MCP client config needs no env edits.
+- **The seven `advisor_*` operator tools** — `advisor_login`, `advisor_status`,
+  `advisor_models`, `advisor_configure`, `advisor_set_token`, `advisor_logout`,
+  `advisor_auth_check`. "Advisor" describes the role, not the vendor.
+- `review_code` and `compare_approaches`.
+- The answer format, the footer, and the transcript file from 0.7.0.
+
+### Migrating
+
+1. Reinstall so the new command exists:
+   `uv tool install --force /path/to/wisdomtooth-mcp` (the old
+   `claude-advisor-mcp` command is not removed for you — `uv tool uninstall
+   claude-advisor-mcp` does that).
+2. In the MCP client config, change `"command"` to `wisdomtooth-mcp`, and
+   rename the server key to `wisdomtooth` if you want the label to match.
+3. If `ask_claude` appears in an `alwaysAllow` list, an agent rules file, or a
+   custom prompt, change it to `ask_wisdomtooth`. **This is the one that bites
+   silently:** a stale `alwaysAllow` entry does not error, it just starts
+   prompting for approval again.
+
+### Your stored login survives
+
+The state directory moved to `~/.wisdomtooth/`, but `_state_dir()` still
+returns the old `~/.claude-advisor/` when that is the only one present. An
+upgrade therefore keeps the OAuth token, `config.json`, and existing consult
+transcripts in place — a rebrand must not sign the user out. Move the directory
+by hand if you want the new name on disk; nothing reads the old one once the
+new one exists, so **do not create both**.
+
+### On "provider-agnostic"
+
+The name is the only part of that shipped in 0.8.0. Both backends still talk to
+Claude — `_consult_claude_code` via the Claude Code CLI and `_consult_api` via
+the Anthropic SDK. A second provider means a third backend behind the same
+`_consult` contract; nothing in the tool surface or config layer blocks it, but
+nothing implements it yet either. Do not tell users they can point this at
+ChatGPT today.
+
+---
+
+
 ## 0.7.0 — the answer now outlives the chat window
 
 **Nothing to change; new behaviour is on by default.**
@@ -10,7 +75,7 @@ model paraphrases it into two sentences, and a context trim eventually deletes
 it. Users were reading answers out of their inference server's logs.
 
 1. **Every consult is now written to a Markdown file** in
-   `~/.claude-advisor/consults/`, named
+   `~/.wisdomtooth/consults/`, named
    `<timestamp>-<tool>-<question-slug>.md`. It holds what was sent (after the
    same secret redaction that guards the wire), what came back, and which
    account paid. The newest `ADVISOR_CONSULT_KEEP` (200) are kept.
@@ -24,9 +89,9 @@ it. Users were reading answers out of their inference server's logs.
 
 ### For agents calling this server
 
-`ask_claude`, `review_code` and `compare_approaches` now return **two content
-blocks** rather than one, and no longer declare an output schema. The answer
-text is unchanged and still the first block, so a client that reads text
+`ask_wisdomtooth`, `review_code` and `compare_approaches` now return **two
+content blocks** rather than one, and no longer declare an output schema. The
+answer text is unchanged and still the first block, so a client that reads text
 results needs no change. When the footer carries a `[saved: ...]` path, give
 that path to the user — it is the copy they can actually read.
 
@@ -63,7 +128,7 @@ remove capability.
    budget is expressed in the system prompt, which both backends honour. Set
    `0` to restore unlimited answers.
 2. **`ADVISOR_MINIMAL_TOOLS` (new, default off).** Set `1` to advertise only
-   `ask_claude` and `advisor_status`. Tool schemas are charged against the
+   `ask_wisdomtooth` and `advisor_status`. Tool schemas are charged against the
    caller's context on every turn: measured ~3,340 tokens for all ten tools
    versus ~1,090 for two — 41% versus 13% of an 8k window. Hidden tools are
    still ordinary functions; only the advertised schema shrinks.
@@ -77,8 +142,9 @@ needs a config edit and restart. `kilo-configs/kilo.local-models.jsonc` is a
 ready-made preset. See `USAGE.md` for the full guide.
 
 **Verified end to end against a real local model** (Qwen3.8-27B via LM Studio,
-using the same prompt assembly Kilo performs): it escalated with `ask_claude`,
-filled all three required arguments, chose its own model/effort tier, and got a
+using the same prompt assembly Kilo performs): it escalated with
+`ask_wisdomtooth`, filled all three required arguments, chose its own
+model/effort tier, and got a
 usable in-budget answer — in both full and minimal tool modes.
 
 ---
@@ -100,7 +166,7 @@ both mcp 1.x and mcp 2.x.
 
 ### Install
 ```bash
-uv tool install --force /path/to/claude-advisor-mcp
+uv tool install --force /path/to/wisdomtooth-mcp
 ```
 Then **restart the MCP server entry in your client** and call `advisor_status`.
 Its first line must read `version: 0.4.0`. If it does not, you are running old
@@ -134,12 +200,12 @@ an old instance is still running — stop the client's server entry first.)
    waits for the browser flow, and switches the advisor onto subscription
    billing immediately. For headless hosts and GUI-launched editors,
    `claude setup-token` + `advisor_set_token` stores the credential in
-   `~/.claude-advisor/credentials.json` (owner-only) and injects it into every
+   `~/.wisdomtooth/credentials.json` (owner-only) and injects it into every
    consult — so `CLAUDE_CODE_OAUTH_TOKEN` in the MCP client's JSON is no longer
    needed, and the secret stays out of a committable file. Existing
    `CLAUDE_CODE_OAUTH_TOKEN` env settings still work and take precedence.
 6. **A JSON config file** is read from `ADVISOR_CONFIG`, else
-   `~/.claude-advisor/config.json`. Environment variables override it.
+   `~/.wisdomtooth/config.json`. Environment variables override it.
 7. **`advisor_auth_check` uses `claude auth status --json`** instead of
    sniffing for a credentials file, so it reports the real login state, auth
    method, and plan — and flags a CLI that is logged in with an API key
@@ -158,8 +224,8 @@ an old instance is still running — stop the client's server entry first.)
 - Tool use was discouraged by a system-prompt sentence the model could ignore;
   it is now enforced with `--tools ""`.
 - Error messages were being replaced by a generic "Error executing tool
-  ask_claude" before reaching the agent, hiding the login instructions that are
-  the whole point of an auth failure. Failures now raise `AdvisorError`
+  ask_wisdomtooth" before reaching the agent, hiding the login instructions
+  that are the whole point of an auth failure. Failures now raise `AdvisorError`
   (a `ToolError` subclass), whose text the SDK preserves.
 - Requests are streamed, so a large `max_tokens` no longer risks an HTTP
   timeout; `stop_reason: "refusal"` is reported clearly instead of surfacing as
@@ -175,7 +241,7 @@ uv venv && uv pip install -e . pytest pytest-asyncio anyio
 ```
 Then in your client: `advisor_status` → `advisor_auth_check` → `advisor_login`
 if it reports anything other than a claude.ai subscription → one real
-`ask_claude` with `model: "fast"`.
+`ask_wisdomtooth` with `model: "fast"`.
 
 ---
 
@@ -186,12 +252,12 @@ if it reports anything other than a claude.ai subscription → one real
 ### Why it hung AGAIN despite the source having the fix
 Two independent causes; check BOTH:
 
-1. **STALE INSTALLED COPY (most likely).** `claude-advisor-mcp.exe` is a
+1. **STALE INSTALLED COPY (most likely).** `wisdomtooth-mcp.exe` is a
    uv/pipx shim running a COPY of the package frozen at install time.
    Verifying the source tree proves nothing about what's running, and
    `advisor_status` existed before the fix, so a healthy status doesn't
    either. FIX: reinstall with `uv tool install --force .` (or
-   `pipx reinstall claude-advisor-mcp`), restart the Kilo server entry, then
+   `pipx reinstall wisdomtooth-mcp`), restart the Kilo server entry, then
    call `advisor_status` — it now reports `version:` as its FIRST line.
    **If it does not say `version: 0.3.5`, you are running old code. Stop and
    reinstall. Do not debug anything else until the version matches.**
@@ -238,7 +304,7 @@ contradictory pipe-test result.
 2. `advisor_status` → first line MUST be `version: 0.3.5`.
 3. `advisor_auth_check` → resolve anything it flags (relay login steps to
    the user; you cannot do them).
-4. Smoke test `ask_claude` (model="fast") → expect seconds; a timeout now
+4. Smoke test `ask_wisdomtooth` (model="fast") → expect seconds; a timeout now
    returns diagnostics instead of hanging.
 
 ## 0.3.3 addition — NSFW scrubbing (apply with everything below)
@@ -246,7 +312,7 @@ contradictory pipe-test result.
 - YOU (the agent) must now scrub all content passed to advisor tools —
   files, logs, pasted text, history — replacing NSFW words with SFW
   alternatives before the call (whole words only; never alter substrings
-  inside identifiers). See the updated .kilocode/rules/claude-advisor.md.
+  inside identifiers). See the updated .kilocode/rules/wisdomtooth.md.
 - The server backstops this: word-boundary, case-preserving NSFW→SFW
   replacement on question + context. Configure via ADVISOR_NSFW_EXTRA_JSON
   (extend wordlist) / ADVISOR_NSFW_SCRUB=0 (disable). Verify version 0.3.3.
@@ -263,25 +329,26 @@ contradictory pipe-test result.
   at 60k chars with a truncation marker (`ADVISOR_MAX_CONTEXT_CHARS`).
 - Adaptive-thinking models at effort high/max get raised max_tokens so the
   answer isn't consumed by thinking; empty-answer guard added.
-- READ `GOTCHAS.md` (new) and the updated `.kilocode/rules/claude-advisor.md`
+- READ `GOTCHAS.md` (new) and the updated `.kilocode/rules/wisdomtooth.md`
   — they contain operational rules you (the agent) must follow: timeout
   alignment, absolute paths on Windows, restart-after-config-change,
   no backend switching on limit errors, advice-is-not-instructions,
   two-strikes escalation stop.
-- Verify version after install: `pip show claude-advisor-mcp` → 0.3.2.
+- Verify version after install: `pip show wisdomtooth-mcp` → 0.3.2.
 
 ## 🔥 HOTFIX 0.3.1 — fixes the hanging smoke test you observed
 
-Root cause of the ~2-minute hang on `ask_claude`: the `claude -p` subprocess
-inherited the MCP server's stdin — which is the client's JSON-RPC pipe, held
-open for the whole session. `claude -p` treats piped stdin as input and waits
-for EOF before answering, so it blocked forever. Your piped-all-at-once test
-worked precisely because closing the pipe delivered that EOF. This was a bug
+Root cause of the ~2-minute hang on `ask_wisdomtooth`: the `claude -p`
+subprocess inherited the MCP server's stdin — which is the client's JSON-RPC
+pipe, held open for the whole session. `claude -p` treats piped stdin as input
+and waits for EOF before answering, so it blocked forever. Your
+piped-all-at-once test worked precisely because closing the pipe delivered that
+EOF. This was a bug
 in the server's subprocess call, not in Kilo, not in Windows stdio framing.
 
 0.3.1 changes:
 - `stdin=subprocess.DEVNULL` on the claude subprocess (the actual fix).
-- Runs claude in an isolated empty workdir (`~/.claude-advisor/workdir`) so
+- Runs claude in an isolated empty workdir (`~/.wisdomtooth/workdir`) so
   it never loads CLAUDE.md/project state from the MCP client's cwd and
   avoids first-run trust prompts.
 - Windows: `claude.cmd`/`.bat` shims are invoked via `cmd /c`; no console
@@ -291,10 +358,10 @@ in the server's subprocess call, not in Kilo, not in Windows stdio framing.
   Do NOT retry timeouts in a loop — surface them to the user.
 - The API backend also gets a bounded SDK timeout (same env var).
 
-TO APPLY: replace `claude_advisor/server.py` and `pyproject.toml` with the
+TO APPLY: replace `wisdomtooth/server.py` and `pyproject.toml` with the
 0.3.1 versions, reinstall (`uv tool install --force .` / `pipx install
 --force .` / `pip install -e .`), restart the MCP server entry in Kilo, then
-re-run your smoke test: `ask_claude(question="what is 2+2? one word",
+re-run your smoke test: `ask_wisdomtooth(question="what is 2+2? one word",
 context="smoke test", attempts_so_far="smoke test", model="fast")`. Expect an
 answer in seconds with a `billed to ...` footer. If it now *errors* about
 login, run `claude` → `/login` interactively once — that blocking login was
@@ -327,7 +394,7 @@ Your deployed 0.2.x version bills EVERY advisor call to the user's Anthropic
    `ADVISOR_CLAUDE_BIN`, `ADVISOR_TIMEOUT`, `ADVISOR_TRANSPORT`,
    `ADVISOR_HOST`, `ADVISOR_PORT`. Default `ADVISOR_MAX_TOKENS` is now 8192.
 6. `pyproject.toml` version is `0.3.0`. Verify after install:
-   `pip show claude-advisor-mcp` (or check the stderr banner exists).
+   `pip show wisdomtooth-mcp` (or check the stderr banner exists).
 
 ## 1. ⛔ STOP — ask the user ONE question before touching anything
 
@@ -343,10 +410,10 @@ Do not guess; this is a money decision.
 ## 2. Replace the sources (both paths)
 
 Overwrite the old project directory with the 0.3.0 tree from
-`claude-advisor-mcp.zip` (or apply these files: `claude_advisor/server.py`,
+`wisdomtooth-mcp.zip` (or apply these files: `wisdomtooth/server.py`,
 `pyproject.toml`, `Dockerfile`, `kilo-configs/*`, `.kilocode/rules/*`,
 `README.md`). Do NOT keep the old single-file `server.py` at the repo root
-if one exists — 0.3.0 lives in the `claude_advisor/` package.
+if one exists — 0.3.0 lives in the `wisdomtooth/` package.
 
 ## 3A. Path A — SUBSCRIPTION billing (user-preferred)
 
@@ -359,28 +426,28 @@ The container you built CANNOT do this: the `claude-code` backend needs the
    - Ask the user to run `/status` inside `claude` and confirm it shows
      their subscription, not an API key. If it shows an API key, tell them
      to `unset ANTHROPIC_API_KEY` in their shell profile first.
-2. Install on the host: `uv tool install /path/to/claude-advisor-mcp`
+2. Install on the host: `uv tool install /path/to/wisdomtooth-mcp`
    (fallbacks: `pipx install`, or `pip install` in a dedicated venv and use
    the venv's bin path in the config).
 3. Update Kilo config: replace the advisor's docker-based entry with the
    contents of `kilo-configs/kilo.subscription.jsonc` — command
-   `["claude-advisor-mcp"]`, environment `{"ADVISOR_BACKEND": "claude-code"}`,
+   `["wisdomtooth-mcp"]`, environment `{"ADVISOR_BACKEND": "claude-code"}`,
    timeout `300000`. Do NOT put `ANTHROPIC_API_KEY` in this entry.
 4. Decommission or repurpose the container:
    - Default: stop and remove it (`docker rm -f <name>`); it billed the API
      account and is now redundant.
    - Only if the user asks to keep an API-billed fallback: keep it as a
-     second server entry named `claude-advisor-api`, disabled by default.
+     second server entry named `wisdomtooth-api`, disabled by default.
 
 ## 3B. Path B — API billing (keep your container)
 
 1. Rebuild the image from the new sources:
-   `docker build -t claude-advisor-mcp:0.3.0 .`
+   `docker build -t wisdomtooth-mcp:0.3.0 .`
 2. Choose transport:
    - Keep stdio (simplest): Kilo command
-     `["docker","run","-i","--rm","-e","ANTHROPIC_API_KEY","claude-advisor-mcp:0.3.0"]`.
+     `["docker","run","-i","--rm","-e","ANTHROPIC_API_KEY","wisdomtooth-mcp:0.3.0"]`.
    - Or persistent HTTP: run once
-     `docker run -d --name claude-advisor -p 8484:8484 -e ANTHROPIC_API_KEY=... -e ADVISOR_TRANSPORT=http -e ADVISOR_HOST=0.0.0.0 claude-advisor-mcp:0.3.0`
+     `docker run -d --name wisdomtooth -p 8484:8484 -e ANTHROPIC_API_KEY=... -e ADVISOR_TRANSPORT=http -e ADVISOR_HOST=0.0.0.0 wisdomtooth-mcp:0.3.0`
      and set the Kilo entry to `{"type":"remote","url":"http://localhost:8484/mcp"}`.
 3. Remove any container/image built from 0.2.x sources to avoid version
    confusion (`docker rmi` the old tag).
@@ -388,14 +455,14 @@ The container you built CANNOT do this: the `claude-code` backend needs the
 ## 4. Verify (both paths) — all four checks must pass
 
 1. Kilo shows the server connected with FOUR tools:
-   `ask_claude`, `review_code`, `compare_approaches`, `advisor_status`.
+   `ask_wisdomtooth`, `review_code`, `compare_approaches`, `advisor_status`.
    If `advisor_status` is missing, you are still running 0.2.x — recheck
    step 2/3.
 2. Call `advisor_status` (free). Its `billing:` line must match the user's
    choice from step 1. If it says "DEVELOPER API account" but the user chose
    subscription (or vice versa), ⛔ STOP and fix the config before any
    advice call is made.
-3. Make ONE cheap real call: `ask_claude` with `model="fast"` and a trivial
+3. Make ONE cheap real call: `ask_wisdomtooth` with `model="fast"` and a trivial
    question, filling `attempts_so_far` honestly (e.g. "migration smoke
    test"). Confirm the answer footer says the expected billing target.
 4. Report to the user: backend, billing target, transport, and the footer
@@ -403,7 +470,7 @@ The container you built CANNOT do this: the `claude-code` backend needs the
 
 ## 5. Rules file
 
-Ensure `.kilocode/rules/claude-advisor.md` from this repo is present in the
+Ensure `.kilocode/rules/wisdomtooth.md` from this repo is present in the
 project. It is unchanged in spirit but you should re-copy it to be safe.
 Continue to honor it: the advisor is an escalation path — Context7 and your
 own attempts come first, and `attempts_so_far` must be filled truthfully.

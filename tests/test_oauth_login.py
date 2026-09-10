@@ -21,7 +21,7 @@ def home(tmp_path, monkeypatch):
 
 
 def creds_path(home):
-    return home / ".claude-advisor" / "credentials.json"
+    return home / ".wisdomtooth" / "credentials.json"
 
 
 def write_creds(home, **data):

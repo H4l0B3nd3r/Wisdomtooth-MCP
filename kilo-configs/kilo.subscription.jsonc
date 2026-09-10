@@ -4,9 +4,9 @@
 // No ANTHROPIC_API_KEY needed or wanted here.
 {
   "mcp": {
-    "claude-advisor": {
+    "wisdomtooth": {
       "type": "local",
-      "command": ["claude-advisor-mcp"],
+      "command": ["wisdomtooth-mcp"],
       "environment": {
         "ADVISOR_BACKEND": "claude-code",
         "ADVISOR_MODEL": "balanced",

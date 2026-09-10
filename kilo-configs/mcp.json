@@ -1,7 +1,7 @@
 {
   "mcpServers": {
-    "claude-advisor": {
-      "command": "claude-advisor-mcp",
+    "wisdomtooth": {
+      "command": "wisdomtooth-mcp",
       "args": [],
       "env": {
         "ADVISOR_BACKEND": "auto",

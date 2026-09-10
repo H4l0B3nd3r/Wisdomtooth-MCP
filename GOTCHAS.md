@@ -3,6 +3,23 @@
 Ordered roughly by how likely they are to bite. "Fixed in code" items are
 handled automatically; the rest need awareness or config.
 
+## Fixed in code (0.8.0) — know they exist, don't re-break them
+
+000. **`~/.wisdomtooth` and `~/.claude-advisor` must never both exist.**
+   `_state_dir()` returns the legacy `.claude-advisor` only when
+   `.wisdomtooth` is absent, so that the 0.8.0 rename does not throw away an
+   existing OAuth token. The instant `.wisdomtooth` appears, every reader
+   switches to it — and a login sitting in the old directory becomes
+   invisible, which presents as "the server logged me out for no reason".
+   Move the directory, don't copy it. Every path that touches $HOME goes
+   through `_state_dir()`; adding a sixth that calls `expanduser` directly
+   reintroduces the split-brain this helper exists to prevent.
+
+000a. **The tool is `ask_wisdomtooth`, and `ADVISOR_*`/`advisor_*` stayed.**
+   Not an oversight — the env vars and operator tools describe a role, not a
+   vendor, and renaming them would have broken every deployed client config
+   for no gain. Do not "finish the rename" by changing them.
+
 ## Fixed in code (0.7.0) — know they exist, don't re-break them
 
 00. **A tool result is the ONLY thing a server can put in front of a human,
@@ -11,7 +28,7 @@ handled automatically; the rest need awareness or config.
    pane, and `annotations.audience` is a hint no client acts on today. Kilo and
    Cline do render an MCP result, but collapsed — and a small local model will
    often paraphrase it away before the user ever sees it. Hence the transcript
-   file in `~/.claude-advisor/consults/`, whose path is quoted in the answer
+   file in `~/.wisdomtooth/consults/`, whose path is quoted in the answer
    footer *and* attached as a `resource_link`. Deleting either half puts the
    user back to reading answers out of their inference server's logs.
 
@@ -38,10 +55,11 @@ handled automatically; the rest need awareness or config.
 
 0a. **Tool errors must be `ToolError`.** The MCP SDK treats any other exception
    as a server crash and replaces its message with a generic
-   "Error executing tool ask_claude" — which would hide every diagnostic this
-   server produces, including the login steps that are the entire value of an
-   auth failure. All user-facing failures raise `AdvisorError`, which subclasses
-   the SDK's `ToolError`. Do not "simplify" it back to `RuntimeError`.
+   "Error executing tool ask_wisdomtooth" — which would hide every diagnostic
+   this server produces, including the login steps that are the entire value
+   of an auth failure. All user-facing failures raise `AdvisorError`, which
+   subclasses the SDK's `ToolError`. Do not "simplify" it back to
+   `RuntimeError`.
 
 0b. **The prompt goes on stdin, the system prompt in a file.** Windows caps a
    command line at ~32k characters, and ~8k through `cmd.exe` — while the
@@ -112,7 +130,7 @@ handled automatically; the rest need awareness or config.
   to the user rather than retrying.
 - **`claude setup-token` + `advisor_set_token` is the durable answer** for
   servers spawned by GUI editors. The token is stored in
-  `~/.claude-advisor/credentials.json` with owner-only permissions and injected
+  `~/.wisdomtooth/credentials.json` with owner-only permissions and injected
   into every CLI subprocess, which avoids the whole class of "works in my
   terminal, fails from VS Code" credential issues — and, unlike the old
   `CLAUDE_CODE_OAUTH_TOKEN`-in-the-MCP-config approach, keeps the secret out of
@@ -146,7 +164,7 @@ handled automatically; the rest need awareness or config.
    can return its diagnostic error — you'd be back to mystery hangs.
 9. **PATH in GUI-launched editors (Windows/macOS).** VS Code started from
    the dock/Start menu often lacks the shell PATH where pipx/uv installed
-   `claude-advisor-mcp` (and `claude`). Symptom: "command not found" or
+   `wisdomtooth-mcp` (and `claude`). Symptom: "command not found" or
    instant server-failed status. Fix: use the ABSOLUTE path to the
    executable in the Kilo config, and set `ADVISOR_CLAUDE_BIN` to the full
    path of `claude` for the subscription backend.
@@ -158,7 +176,7 @@ handled automatically; the rest need awareness or config.
    LIVE values; trust it over the config file when they disagree.
 
 10a. **Precedence, when settings disagree.** per-call argument > runtime
-   `advisor_configure` > environment variable > `~/.claude-advisor/config.json`
+   `advisor_configure` > environment variable > `~/.wisdomtooth/config.json`
    > built-in default. `ADVISOR_LOCK=1` inverts the top two away: per-call and
    runtime changes are rejected and the configured defaults always win.
 11. **HTTP transport has NO auth.** `ADVISOR_TRANSPORT=http` on
@@ -173,13 +191,13 @@ handled automatically; the rest need awareness or config.
     change you intend to install, or force a real rebuild with
     `uv tool install --force --reinstall --no-cache .`. Verify by grepping the
     installed copy under
-    `<uv tool dir>/claude-advisor-mcp/Lib/site-packages/claude_advisor/server.py`
+    `<uv tool dir>/wisdomtooth-mcp/Lib/site-packages/wisdomtooth/server.py`
     for something the change introduced, not by trusting the version string.
 
 11b. **A running server locks its own install directory (Windows).**
     `uv tool install` fails with "Access is denied ... Scripts" while an MCP
     client still has the stdio server alive. Stop/toggle the server entry in
-    the client (or kill the `claude-advisor-mcp` processes) before installing.
+    the client (or kill the `wisdomtooth-mcp` processes) before installing.
 
 12. **Claude Code auto-updates.** The CLI updates itself; flags and headless
     behavior can drift. If the subscription backend suddenly errors after
@@ -206,7 +224,7 @@ handled automatically; the rest need awareness or config.
     says escalate after its own attempts fail, so a model that reasons first on
     turn one is following it. Suspect a real problem only if it never escalates
     after repeated failures — then check that
-    `.kilocode/rules/claude-advisor.md` is actually installed in the project.
+    `.kilocode/rules/wisdomtooth.md` is actually installed in the project.
 
 15d. **A thinking model needs output headroom to call a tool at all.** If your
     client caps completion tokens too low, a reasoning model burns the whole
