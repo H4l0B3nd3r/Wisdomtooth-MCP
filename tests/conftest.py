@@ -162,6 +162,10 @@ log(prompt)
 
 mode = os.environ.get("FAKE_CLAUDE_MODE", "ok")
 
+if mode == "slow":  # a long consult that does finish
+    time.sleep(float(os.environ.get("FAKE_CLAUDE_SLEEP", "3")))
+    mode = "ok"
+
 if mode == "hang":
     time.sleep(600)
 elif mode == "auth_fail":

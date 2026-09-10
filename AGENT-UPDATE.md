@@ -1,5 +1,41 @@
 # AGENT-UPDATE.md — Migration playbook
 
+## 0.8.1 — large consults no longer die at 180s
+
+**Nothing to change in the client config. Reinstall and restart the server entry.**
+
+A big planning consult (Opus, effort=high, `ADVISOR_ANSWER_BUDGET=10000`) was
+killed at the flat 180s limit. Before 0.6.0 the budget variable did not exist,
+so a config carrying `10000` got unbudgeted answers; since 0.6.0 the system
+prompt invites answers up to that length, and generating them outruns 180s.
+Two fixes, both server-side:
+
+1. **The kill timeout is sized per consult.** `ADVISOR_TIMEOUT` (default now
+   300s) is the floor; each consult adds ~10s per 1,000 characters sent and
+   ~0.06s per word of answer budget, multiplied ×1.5/×2/×2.5 at effort
+   high/xhigh/max, capped by `ADVISOR_TIMEOUT_MAX` (3600s). The failing shape
+   now gets ~30 minutes; a short question at the defaults ~6.
+   `ADVISOR_TIMEOUT_SCALE=0` restores the flat limit.
+2. **Progress heartbeat.** The client's own per-request timeout (Kilo: the
+   server entry's `timeout`, 300s) would otherwise fire first. Kilo restarts
+   it on every MCP progress notification, and the server now sends one every
+   `ADVISOR_PROGRESS_INTERVAL` (15s) while a consult runs. Clients that did not
+   ask for progress are unaffected.
+
+A timed-out consult's error now states the limit it was given and why, and
+lists "the consult genuinely needs longer" as a cause with the knob to turn.
+
+**Defaults raised for comprehensive answers:** `ADVISOR_ANSWER_BUDGET` 600 →
+64000 words and `ADVISOR_MAX_TOKENS` (API backend) 16000 → 64000. The length
+instruction now calls the budget a ceiling, not a target, and tells Claude to
+size each answer to what the question needs, since every word counts against
+the user's 5-hour and weekly limits. With a 64,000-word ceiling every consult's
+kill timeout sits at `ADVISOR_TIMEOUT_MAX`, so a genuinely hung CLI takes up to
+an hour to surface. **Small-context callers must now set the budget
+explicitly** (the `kilo.local-models.jsonc` preset already uses 500).
+
+---
+
 ## 0.8.0 — renamed to Wisdomtooth
 
 **One breaking change: the `ask_claude` tool is now `ask_wisdomtooth`.**

@@ -41,11 +41,11 @@ from anthropic import Anthropic
 # Both spellings expose the same decorator surface we use, so support each --
 # a fresh `uv tool install` gets 2.x while existing installs are still on 1.x.
 try:  # mcp >= 2.0
-    from mcp.server.mcpserver import MCPServer as _ServerClass
+    from mcp.server.mcpserver import Context, MCPServer as _ServerClass
     from mcp.server.mcpserver.exceptions import ToolError as _ToolError
     _MCP_MAJOR = 2
 except ImportError:  # mcp 1.x
-    from mcp.server.fastmcp import FastMCP as _ServerClass
+    from mcp.server.fastmcp import Context, FastMCP as _ServerClass
     from mcp.server.fastmcp.exceptions import ToolError as _ToolError
     _MCP_MAJOR = 1
 
@@ -119,6 +119,9 @@ CONFIG_KEYS = {
     "effort": "ADVISOR_EFFORT",
     "max_tokens": "ADVISOR_MAX_TOKENS",
     "timeout": "ADVISOR_TIMEOUT",
+    "timeout_scale": "ADVISOR_TIMEOUT_SCALE",
+    "timeout_max": "ADVISOR_TIMEOUT_MAX",
+    "progress_interval": "ADVISOR_PROGRESS_INTERVAL",
     "max_context_chars": "ADVISOR_MAX_CONTEXT_CHARS",
     "max_budget_usd": "ADVISOR_MAX_BUDGET_USD",
     "fallback_to_api": "ADVISOR_FALLBACK_TO_API",
@@ -194,7 +197,23 @@ TRANSPORT = str(_setting("transport", "stdio")).lower()
 HTTP_HOST = str(_setting("host", "127.0.0.1"))
 HTTP_PORT = int(_setting("port", 8484))
 
-TIMEOUT = int(_setting("timeout", 180))
+# How long a consult may run before it is killed. One flat limit cannot fit
+# both a yes/no sanity check and a whole-app redesign plan: a consult's run time
+# grows with what it is sent, how long it may answer, and how hard it is asked
+# to think. So ADVISOR_TIMEOUT is the floor and each consult earns more on top
+# of it, up to ADVISOR_TIMEOUT_MAX -- see `_consult_timeout`.
+# ADVISOR_TIMEOUT_SCALE=0 restores a flat ADVISOR_TIMEOUT.
+TIMEOUT = int(_setting("timeout", 300))
+TIMEOUT_SCALE = max(0.0, float(_setting("timeout_scale", 1.0)))
+TIMEOUT_MAX = max(TIMEOUT, int(_setting("timeout_max", 3600)))
+
+# Seconds between keep-alive progress notifications while a consult runs. MCP
+# clients abort a tool call that stays silent past their own request timeout
+# (Kilo: the per-server `timeout`, 300s in our configs) but restart that clock
+# on every progress notification. The heartbeat is what lets a long consult
+# outlive the client's limit without anyone editing the client's config, so it
+# must stay well under that limit.
+PROGRESS_INTERVAL = max(1, int(_setting("progress_interval", 15)))
 
 # In "auto" mode only, a consult that fails because the subscription's headless
 # quota is exhausted may be retried on API credits. Ignored for an explicit
@@ -205,13 +224,14 @@ FALLBACK_TO_API = _flag("fallback_to_api", True)
 # Optional hard spend cap handed to the CLI (`--max-budget-usd`).
 MAX_BUDGET_USD = _setting("max_budget_usd")
 
-# Roughly how long an answer may be, in words. The advisor's reply is fed back
-# into the CALLING model's context, which for a local 4B-30B model may be 8k-32k
-# tokens in total -- an unbounded Opus answer can consume all of it. `max_tokens`
-# cannot help on the subscription backend (the CLI exposes no such flag), so the
-# budget is expressed in the system prompt, which both backends honour.
-# 0 disables it, for callers with a large context window.
-ANSWER_BUDGET = max(0, int(_setting("answer_budget", 600)))
+# The ceiling on an answer's length, in words. The default is generous so a
+# genuine design or migration plan fits in one answer; the prompt presents it as
+# a ceiling, not a target, because every word lands in the CALLING model's
+# context and is billed against the user's plan limits. `max_tokens` cannot help
+# on the subscription backend (the CLI exposes no such flag), so the budget is
+# expressed in the system prompt, which both backends honour. A small local
+# caller (8k-32k context) should set a few hundred words. 0 removes it.
+ANSWER_BUDGET = max(0, int(_setting("answer_budget", 64000)))
 
 # Expose only the tools an agent actually needs (`ask_wisdomtooth`, `advisor_status`)
 # and hide the operator tools. Every schema is charged against the calling
@@ -306,7 +326,7 @@ DEFAULT_EFFORT = _raw_effort if _raw_effort in VALID_EFFORT else None  # None = 
 # 128k is the current output ceiling on the Opus/Sonnet/Fable families; asking
 # for more is a 400, not a longer answer.
 MAX_TOKENS_CEILING = 128000
-MAX_TOKENS = min(int(_setting("max_tokens", 16000)), MAX_TOKENS_CEILING)
+MAX_TOKENS = min(int(_setting("max_tokens", 64000)), MAX_TOKENS_CEILING)
 
 # Set ADVISOR_LOCK=1 to ignore per-call and runtime model/effort/token choices
 # (hard cost control: the configured defaults always win).
@@ -343,12 +363,41 @@ def _answer_budget_instruction() -> str:
     if budget <= 0:
         return ""
     return (
-        f"\nLength: keep the answer under roughly {budget} words. Your reply is "
-        "inserted into the context window of the agent that asked, which may be "
-        "small. Lead with the recommendation, keep code to the minimum that "
-        "makes it concrete, and drop restatement of the question. If the "
-        "problem genuinely cannot be answered that briefly, give the decisive "
-        "part and say what you left out.\n")
+        f"\nLength: keep the answer under roughly {budget} words -- a ceiling, "
+        "not a target. Size the answer to what the question actually needs; "
+        "most consults need a small fraction of the ceiling, and every word is "
+        "billed against the user's usage limits and inserted into the context "
+        "window of the agent that asked. Lead with the recommendation, keep "
+        "code to the minimum that makes it concrete, and drop restatement of "
+        "the question. Go long only when the problem genuinely demands it, such "
+        "as a full design or migration plan. If even the ceiling is not enough, "
+        "give the decisive part and say what you left out.\n")
+
+
+# Adaptive thinking at high effort and above spends much of a consult reasoning
+# before the first answer token appears.
+_EFFORT_TIME_FACTOR = {"high": 1.5, "xhigh": 2.0, "max": 2.5}
+# An unlimited answer (budget 0) is sized as if it were budgeted this many words.
+_UNBUDGETED_WORDS = 4000
+
+
+def _consult_timeout(prompt_chars: int, effort: Optional[str]) -> int:
+    """Seconds this consult may run, sized to the work it asks for.
+
+    ADVISOR_TIMEOUT, plus ~10s per 1,000 characters sent (system prompt,
+    context and question) and ~0.06s per word of answer budget, times a factor
+    for high effort, capped at ADVISOR_TIMEOUT_MAX. A 40k-character planning
+    consult with a 10,000-word budget at effort=high gets ~32 minutes; a short
+    question with a 600-word budget ~6. The default 64,000-word ceiling sizes
+    every consult at the cap, since an answer that long can legitimately take
+    most of an hour.
+    """
+    if not TIMEOUT_SCALE:
+        return TIMEOUT
+    words = _effective_answer_budget() or _UNBUDGETED_WORDS
+    extra = (prompt_chars / 1000 * 10 + words * 0.06) * TIMEOUT_SCALE
+    seconds = (TIMEOUT + extra) * _EFFORT_TIME_FACTOR.get(effort or "", 1.0)
+    return int(min(seconds, TIMEOUT_MAX))
 
 
 def _resolve_model(model: str = "") -> str:
@@ -408,7 +457,9 @@ def _build_kwargs(model: str, effort: Optional[str], max_tokens: int = 0) -> dic
     # On adaptive-thinking models max_tokens covers thinking AND the answer, so
     # give the answer headroom at the levels that think hardest.
     if thinking == "adaptive":
-        headroom = {"high": 24000, "xhigh": 32000, "max": 48000}.get(effort or "")
+        # Floors above the 64k default; `max` reaches MAX_TOKENS_CEILING.
+        headroom = {"high": 80000, "xhigh": 96000,
+                    "max": MAX_TOKENS_CEILING}.get(effort or "")
         if headroom:
             kwargs["max_tokens"] = max(kwargs["max_tokens"], headroom)
     return kwargs
@@ -1050,18 +1101,25 @@ def _consult_claude_code(system: str, user_content: str, model: str,
     add("--permission-prompts", "none")
     add("--setting-sources", "")      # ignore user/project/local settings
 
+    timeout_s = _consult_timeout(len(system) + len(user_content), effort)
     try:
-        result = _run_claude(cmd, _child_env(), _workdir(), TIMEOUT, user_content)
+        result = _run_claude(cmd, _child_env(), _workdir(), timeout_s,
+                             user_content)
     except subprocess.TimeoutExpired as exc:
         tail = (exc.stderr or "")
         tail = tail.decode(errors="replace") if isinstance(tail, bytes) else tail
         raise AdvisorError(
-            f"claude CLI produced no answer within {TIMEOUT}s and was killed. "
+            f"claude CLI produced no answer within {timeout_s}s and was killed "
+            f"(limit sized for {len(user_content):,} characters of input, an "
+            f"answer budget of {_effective_answer_budget() or 'unlimited'} "
+            "words" + (f" and effort={effort}" if effort else "") + "). "
             "Most likely causes, in order: (1) Claude Code is not logged in -- "
             "run `claude` in a terminal, then `/login` with the claude.ai "
             "(Pro/Max) account; (2) a first-run onboarding/trust prompt is "
             "blocking -- run `claude` interactively once on this machine; "
-            "(3) network issues. Do NOT retry in a loop; surface this to the "
+            "(3) network issues; (4) the consult genuinely needs longer -- the "
+            f"user can raise ADVISOR_TIMEOUT_MAX (now {TIMEOUT_MAX}s) or lower "
+            "ADVISOR_ANSWER_BUDGET. Do NOT retry in a loop; surface this to the "
             "user. stderr tail: " + tail[-400:]
         ) from exc
 
@@ -1547,6 +1605,32 @@ def _model_catalogue() -> str:
     return "\n".join(lines)
 
 
+async def _consult_with_heartbeat(ctx: Optional[Context], *args, **kwargs):
+    """Run `_consult` off the event loop, reporting progress while it works.
+
+    A consult is otherwise silent for its whole run, and MCP clients abort a
+    silent tool call at their own request timeout -- shorter than a large
+    consult. A progress notification restarts that clock in clients that ask
+    for progress (Kilo does), and is a no-op for one that sent no progress
+    token, so the heartbeat runs unconditionally.
+    """
+    work = asyncio.ensure_future(asyncio.to_thread(_consult, *args, **kwargs))
+    started = time.monotonic()
+    while True:
+        done, _ = await asyncio.wait({work}, timeout=PROGRESS_INTERVAL)
+        if done:
+            return work.result()
+        if ctx is None:
+            continue
+        elapsed = int(time.monotonic() - started)
+        try:
+            await ctx.report_progress(
+                elapsed, message=f"Claude is still working ({elapsed}s elapsed)")
+        except Exception as exc:  # a lost heartbeat must not cost the answer
+            print(f"[wisdomtooth] progress notification failed: {exc}",
+                  file=sys.stderr)
+
+
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
@@ -1554,7 +1638,7 @@ def _model_catalogue() -> str:
 @tool(title="Ask Wisdomtooth (escalation)", annotations=CONSULT_ANNOTATIONS)
 async def ask_wisdomtooth(question: str, context: str, attempts_so_far: str,
                           model: str = "", effort: str = "",
-                          max_tokens: int = 0):
+                          max_tokens: int = 0, ctx: Optional[Context] = None):
     """ESCALATION: Ask Wisdomtooth for expert advice when you are stuck.
 
     WHEN TO USE — only when BOTH conditions hold:
@@ -1596,8 +1680,8 @@ async def ask_wisdomtooth(question: str, context: str, attempts_so_far: str,
             Code CLI has no equivalent flag.
     """
     saved: dict = {}
-    answer = await asyncio.to_thread(
-        _consult,
+    answer = await _consult_with_heartbeat(
+        ctx,
         question,
         context=f"{context}\n\n<attempts_so_far>\n{attempts_so_far}\n</attempts_so_far>",
         model=model,
@@ -1612,7 +1696,7 @@ async def ask_wisdomtooth(question: str, context: str, attempts_so_far: str,
 @tool(title="Review code with Claude", annotations=CONSULT_ANNOTATIONS)
 async def review_code(code: str, concern: str = "general quality",
                       model: str = "", effort: str = "",
-                      max_tokens: int = 0):
+                      max_tokens: int = 0, ctx: Optional[Context] = None):
     """ESCALATION: Have Claude review code you are unsure about.
 
     WHEN TO USE: after implementing something non-trivial where you have
@@ -1633,8 +1717,8 @@ async def review_code(code: str, concern: str = "general quality",
             default). Applies to the API backend only.
     """
     saved: dict = {}
-    answer = await asyncio.to_thread(
-        _consult,
+    answer = await _consult_with_heartbeat(
+        ctx,
         question=f"Review this code with a focus on: {concern}. "
         "List concrete issues in priority order, with suggested fixes.",
         context=code,
@@ -1657,7 +1741,7 @@ async def review_code(code: str, concern: str = "general quality",
 @tool(title="Compare approaches with Claude", annotations=CONSULT_ANNOTATIONS)
 async def compare_approaches(problem: str, options: str, criteria: str = "",
                              model: str = "", effort: str = "",
-                             max_tokens: int = 0):
+                             max_tokens: int = 0, ctx: Optional[Context] = None):
     """ESCALATION: Have Claude compare approaches when you can't decide.
 
     WHEN TO USE: you have identified 2+ viable approaches to a non-trivial
@@ -1683,9 +1767,9 @@ async def compare_approaches(problem: str, options: str, criteria: str = "",
         + "\nCompare the tradeoffs briefly, then commit to a single recommendation."
     )
     saved: dict = {}
-    answer = await asyncio.to_thread(_consult, question, model=model,
-                                     effort=effort, max_tokens=max_tokens,
-                                     kind="compare_approaches", saved=saved)
+    answer = await _consult_with_heartbeat(ctx, question, model=model,
+                                           effort=effort, max_tokens=max_tokens,
+                                           kind="compare_approaches", saved=saved)
     return _result_blocks(answer, saved)
 
 
@@ -1925,7 +2009,11 @@ def advisor_status() -> str:
            " (a long answer can overflow a small caller's context)"),
         f"tool surface: {'minimal (ask_wisdomtooth, advisor_status)' if MINIMAL_TOOLS else 'full (10 tools)'}",
         f"consult transcripts: {transcripts}",
-        f"timeout: {TIMEOUT}s",
+        f"timeout: {TIMEOUT}s base"
+        + (f", grows with input size, answer budget and effort "
+           f"(scale {TIMEOUT_SCALE:g}), cap {TIMEOUT_MAX}s" if TIMEOUT_SCALE
+           else " (flat: ADVISOR_TIMEOUT_SCALE=0)"),
+        f"progress heartbeat: every {PROGRESS_INTERVAL}s while a consult runs",
         f"per-call overrides: "
         f"{'LOCKED (env defaults always win)' if LOCKED else 'allowed'}",
         f"transport: {TRANSPORT}",

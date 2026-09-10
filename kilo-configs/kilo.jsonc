@@ -21,8 +21,9 @@
         // "ANTHROPIC_API_KEY": "sk-ant-..."   // optional fallback only
       },
       "enabled": true,
-      // Must exceed ADVISOR_TIMEOUT (default 180s) so the server can return its
-      // own diagnostic error instead of the client killing the call first.
+      // Kilo's per-request timeout, restarted by every progress notification.
+      // The server sends one every ADVISOR_PROGRESS_INTERVAL (15s) during a
+      // consult, so consults may run past this; it only has to exceed 15s.
       "timeout": 300000
     }
   }

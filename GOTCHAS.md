@@ -158,10 +158,13 @@ handled automatically; the rest need awareness or config.
 
 ## Configuration & environment traps
 
-8. **Timeout alignment.** Server-side `ADVISOR_TIMEOUT` (default 180s) must
-   be LOWER than the Kilo per-server `timeout` (our configs use 300000ms).
-   If you inverted them, the client would kill the call before the server
-   can return its diagnostic error — you'd be back to mystery hangs.
+8. **Timeout alignment.** Kilo's per-server `timeout` (our configs: 300000ms)
+   is a *silence* timeout: Kilo calls tools with `resetTimeoutOnProgress`, and
+   the server sends a progress notification every `ADVISOR_PROGRESS_INTERVAL`
+   (15s) while a consult runs. So the server's own kill timeout — sized per
+   consult from `ADVISOR_TIMEOUT` up to `ADVISOR_TIMEOUT_MAX` — may exceed the
+   Kilo value. Keep the heartbeat interval well below the client timeout; a
+   client that ignores progress still kills the call at its own limit.
 9. **PATH in GUI-launched editors (Windows/macOS).** VS Code started from
    the dock/Start menu often lacks the shell PATH where pipx/uv installed
    `wisdomtooth-mcp` (and `claude`). Symptom: "command not found" or
@@ -215,7 +218,8 @@ handled automatically; the rest need awareness or config.
 
 15b. **The answer lands in the caller's context.** An unbounded Opus reply can
     be bigger than a small model's whole window. `ADVISOR_ANSWER_BUDGET`
-    (default 600 words) is the control, and it works on BOTH backends because
+    (default 64000 words — set a few hundred for a small model) is the
+    control, and it works on BOTH backends because
     it goes through the system prompt. `ADVISOR_MAX_TOKENS` does NOT help on
     the subscription backend — the CLI has no such flag, and the answer footer
     says so when you pass one.

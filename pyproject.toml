@@ -1,6 +1,6 @@
 [project]
 name = "wisdomtooth-mcp"
-version = "0.8.0"
+version = "0.8.1"
 description = "MCP server that lets coding agents escalate to a frontier model for advice when stuck (Claude by default)"
 requires-python = ">=3.10"
 # Pins reflect the APIs this server actually uses:

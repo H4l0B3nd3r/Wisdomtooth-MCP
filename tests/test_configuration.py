@@ -62,7 +62,7 @@ def test_a_malformed_config_file_does_not_stop_the_server(server, tmp_path):
 
 
 def test_a_missing_config_file_is_not_an_error(server, tmp_path):
-    assert server(ADVISOR_CONFIG=str(tmp_path / "nope.json")).MAX_TOKENS == 16000
+    assert server(ADVISOR_CONFIG=str(tmp_path / "nope.json")).MAX_TOKENS == 64000
 
 
 # --------------------------------------------------------------------------

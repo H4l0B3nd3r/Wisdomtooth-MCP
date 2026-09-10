@@ -118,14 +118,18 @@ measurably improves tool-selection accuracy in small models.
 ### `ADVISOR_ANSWER_BUDGET` — cap the reply length
 
 Claude's answer lands **inside your local model's context**. An unbounded Opus
-answer can be larger than an 8B model's entire window. This sets a target length
-in words (default 600) and is enforced through the system prompt, which is the
-only lever that works on the subscription backend — the Claude Code CLI has no
-`max_tokens` flag.
+answer can be larger than an 8B model's entire window. This sets a ceiling in
+words (default 64000, generous enough for a full design plan) and is enforced
+through the system prompt, which is the only lever that works on the
+subscription backend — the Claude Code CLI has no `max_tokens` flag. Claude is
+told it is a ceiling, not a target, and to size each answer to the question.
+**The default is sized for a large-context caller — set one of the smaller
+values below for a local model.**
 
 - `300` — tight contexts, quick factual escalations
-- `600` — default, fits ordinary advice
-- `1200` — architecture discussions on a large-context model
+- `600` — ordinary advice on a small local model
+- `1200` — architecture discussions on a mid-size model
+- `64000` — default; frontier callers with large windows
 - `0` — no limit
 
 `max_tokens` also exists but is **API-backend only**; on the subscription

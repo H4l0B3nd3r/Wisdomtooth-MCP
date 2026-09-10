@@ -187,13 +187,16 @@ Five layers, highest priority first:
 | `ADVISOR_BACKEND` | `backend` | `auto` | `auto` / `claude-code` / `api` |
 | `ADVISOR_MODEL` | `model` | `balanced` | Tier alias or full model ID |
 | `ADVISOR_EFFORT` | `effort` | (API default) | `low`/`medium`/`high`/`xhigh`/`max` |
-| `ADVISOR_ANSWER_BUDGET` | `answer_budget` | `600` | Target answer length in words. Works on **both** backends; `0` disables. The only length control the subscription backend has |
+| `ADVISOR_ANSWER_BUDGET` | `answer_budget` | `64000` | Ceiling on answer length in words, presented to Claude as a ceiling, not a target. Works on **both** backends; `0` disables. The only length control the subscription backend has. Set a few hundred for small-context callers |
 | `ADVISOR_MINIMAL_TOOLS` | `minimal_tools` | `0` | `1` advertises only `ask_wisdomtooth` + `advisor_status`, cutting per-turn tool context from ~3340 to ~1090 tokens |
-| `ADVISOR_MAX_TOKENS` | `max_tokens` | `16000` | Answer cap, **API backend only** (the CLI has no such flag), max 128000 |
+| `ADVISOR_MAX_TOKENS` | `max_tokens` | `64000` | Answer cap, **API backend only** (the CLI has no such flag), max 128000 |
 | `ADVISOR_SAVE_CONSULTS` | `save_consults` | `1` | Write every answer to a Markdown file the user can open. `0` disables |
 | `ADVISOR_CONSULT_DIR` | `consult_dir` | `~/.wisdomtooth/consults` | Where those files go |
 | `ADVISOR_CONSULT_KEEP` | `consult_keep` | `200` | Keep the newest N transcripts; `0` keeps everything |
-| `ADVISOR_TIMEOUT` | `timeout` | `180` | Seconds before a consult is killed |
+| `ADVISOR_TIMEOUT` | `timeout` | `300` | Base seconds before a consult is killed; each consult adds ~10s per 1k chars sent and ~0.06s per answer-budget word, ×1.5/2/2.5 at effort high/xhigh/max |
+| `ADVISOR_TIMEOUT_MAX` | `timeout_max` | `3600` | Upper bound on that sized timeout |
+| `ADVISOR_TIMEOUT_SCALE` | `timeout_scale` | `1` | Multiplier on the size-based extra time; `0` = flat `ADVISOR_TIMEOUT` |
+| `ADVISOR_PROGRESS_INTERVAL` | `progress_interval` | `15` | Seconds between keep-alive progress notifications during a consult; keeps the client's own request timeout from firing |
 | `ADVISOR_LOCK` | `lock` | `0` | `1` pins model/effort/tokens |
 | `ADVISOR_TIERS_JSON` | `tiers` | — | Remap/extend tiers, e.g. `{"deep":"claude-fable-5-1"}` |
 | `ADVISOR_SYSTEM_PROMPT` | `system_prompt` | — | Replace the advisor persona |

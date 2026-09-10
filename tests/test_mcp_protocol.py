@@ -208,7 +208,8 @@ async def test_server_answers_other_requests_during_a_slow_consult(fake_claude):
 
     params = _params(ADVISOR_CLAUDE_BIN=str(fake_claude.path),
                      FAKE_CLAUDE_LOG=str(fake_claude.log),
-                     FAKE_CLAUDE_MODE="hang", ADVISOR_TIMEOUT="8")
+                     FAKE_CLAUDE_MODE="hang", ADVISOR_TIMEOUT="8",
+                     ADVISOR_TIMEOUT_SCALE="0")
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
@@ -225,6 +226,36 @@ async def test_server_answers_other_requests_during_a_slow_consult(fake_claude):
                     tools = await session.list_tools()
                 assert tools.tools
                 tg.cancel_scope.cancel()
+
+
+async def test_a_long_consult_sends_progress_heartbeats(fake_claude):
+    """Kilo aborts a tool call that stays silent past its per-server timeout
+    but restarts that clock on every progress notification, so a consult
+    longer than the client's limit survives only if the server keeps talking."""
+    ticks = []
+
+    async def on_progress(progress, total, message):
+        ticks.append(progress)
+
+    async with advisor_session(fake_claude, FAKE_CLAUDE_MODE="slow",
+                               FAKE_CLAUDE_SLEEP="4",
+                               ADVISOR_PROGRESS_INTERVAL="1") as s:
+        result = await s.call_tool("ask_wisdomtooth", {
+            "question": "q", "context": "c", "attempts_so_far": "a"},
+            progress_callback=on_progress)
+    text = "\n".join(b.text for b in result.content
+                     if isinstance(b, types.TextContent))
+    assert "FAKE ANSWER" in text
+    assert len(ticks) >= 2
+    assert ticks == sorted(ticks)
+
+
+async def test_the_context_parameter_is_not_advertised(fake_claude):
+    """The heartbeat's `ctx` is injected by the SDK, never a tool argument."""
+    async with advisor_session(fake_claude) as session:
+        for tool in (await session.list_tools()).tools:
+            schema = field(tool, "inputSchema", "input_schema")
+            assert "ctx" not in schema.get("properties", {}), tool.name
 
 
 # --------------------------------------------------------------------------

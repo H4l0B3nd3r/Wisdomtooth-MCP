@@ -37,7 +37,7 @@
         "ADVISOR_EFFORT": "high"
       },
       "enabled": true,
-      // Must exceed ADVISOR_TIMEOUT (default 180s).
+      // Restarted by the server's 15s progress heartbeat; consults may run longer.
       "timeout": 300000
     }
   }

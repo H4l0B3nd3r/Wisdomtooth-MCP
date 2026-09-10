@@ -240,10 +240,63 @@ def test_nonzero_exit_reports_stderr(server, fake_claude, monkeypatch):
 
 def test_timeout_errors_out_instead_of_hanging(server, fake_claude, monkeypatch):
     monkeypatch.setenv("FAKE_CLAUDE_MODE", "hang")
-    srv = server(ADVISOR_BACKEND="claude-code", ADVISOR_TIMEOUT="2")
+    srv = server(ADVISOR_BACKEND="claude-code", ADVISOR_TIMEOUT="2",
+                 ADVISOR_TIMEOUT_SCALE="0")
     with pytest.raises(RuntimeError) as exc:
         consult(srv)
     assert "2s" in str(exc.value)
+
+
+# --------------------------------------------------------------------------
+# The kill timeout is sized to the consult
+# --------------------------------------------------------------------------
+
+def test_timeout_grows_with_input_size(server):
+    srv = server(ADVISOR_BACKEND="claude-code", ADVISOR_ANSWER_BUDGET="600")
+    small = srv._consult_timeout(2_000, None)
+    large = srv._consult_timeout(60_000, None)
+    assert small >= srv.TIMEOUT
+    assert large >= small + 500
+
+
+def test_timeout_grows_with_answer_budget_and_effort(server):
+    short = server(ADVISOR_ANSWER_BUDGET="600")._consult_timeout(10_000, None)
+    srv = server(ADVISOR_ANSWER_BUDGET="10000")
+    assert srv._consult_timeout(10_000, None) > short
+    assert srv._consult_timeout(10_000, "high") > srv._consult_timeout(10_000, None)
+
+
+def test_large_planning_consult_outlasts_the_old_flat_limit(server):
+    """The regression: a big UI/UX planning consult (deep, effort=high,
+    10,000-word budget) was killed at a flat 180s."""
+    srv = server(ADVISOR_ANSWER_BUDGET="10000", ADVISOR_MODEL="deep",
+                 ADVISOR_EFFORT="high")
+    assert srv._consult_timeout(40_000, "high") >= 1200
+
+
+def test_timeout_is_capped(server):
+    srv = server(ADVISOR_TIMEOUT_MAX="900")
+    assert srv._consult_timeout(10_000_000, "max") == 900
+
+
+def test_timeout_scale_zero_restores_a_flat_limit(server):
+    srv = server(ADVISOR_TIMEOUT="42", ADVISOR_TIMEOUT_SCALE="0")
+    assert srv._consult_timeout(60_000, "max") == 42
+
+
+def test_consult_hands_the_scaled_timeout_to_the_cli(server, fake_claude,
+                                                      monkeypatch):
+    srv = server(ADVISOR_BACKEND="claude-code", ADVISOR_ANSWER_BUDGET="600")
+    seen = []
+    real = srv._run_claude
+
+    def spy(cmd, env=None, workdir=None, timeout_s=60, stdin_text=""):
+        seen.append(timeout_s)
+        return real(cmd, env, workdir, timeout_s, stdin_text)
+
+    monkeypatch.setattr(srv, "_run_claude", spy)
+    consult(srv, context="lorem ipsum dolor sit amet " * 2000)
+    assert seen[-1] >= srv.TIMEOUT + 500
 
 
 def test_missing_cli_gives_actionable_error(server, no_claude):
