@@ -52,8 +52,14 @@ def test_tools_are_disabled_with_a_flag_not_a_polite_request(server, fake_claude
     assert argv[argv.index("--tools") + 1] == ""
 
 
-def test_output_format_is_json(server, fake_claude):
-    """JSON carries is_error and the model actually used; text carries neither."""
+def test_output_format_is_json_when_the_cli_cannot_stream(server, fake_claude,
+                                                          tmp_path):
+    """JSON carries is_error and the model actually used; text carries neither.
+    A CLI that streams gets `stream-json` instead -- see test_streaming.py."""
+    script = tmp_path / "fake_claude.py"
+    src = script.read_text(encoding="utf-8")
+    script.write_text(src.replace("  --include-partial-messages\n", ""),
+                      encoding="utf-8")
     srv = server(ADVISOR_BACKEND="claude-code")
     consult(srv)
     assert fake_claude.flag_value("--output-format") == "json"
@@ -290,9 +296,9 @@ def test_consult_hands_the_scaled_timeout_to_the_cli(server, fake_claude,
     seen = []
     real = srv._run_claude
 
-    def spy(cmd, env=None, workdir=None, timeout_s=60, stdin_text=""):
+    def spy(cmd, env=None, workdir=None, timeout_s=60, stdin_text="", **kw):
         seen.append(timeout_s)
-        return real(cmd, env, workdir, timeout_s, stdin_text)
+        return real(cmd, env, workdir, timeout_s, stdin_text, **kw)
 
     monkeypatch.setattr(srv, "_run_claude", spy)
     consult(srv, context="lorem ipsum dolor sit amet " * 2000)

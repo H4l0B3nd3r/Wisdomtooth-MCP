@@ -8,7 +8,8 @@ Two things make this server awkward to test, and both are solved here:
 
 2. The subscription backend shells out to the real `claude` CLI. `fake_claude`
    installs a stand-in executable that speaks the same contract (flags,
-   stdin prompt, `--output-format json`) and records every invocation, so the
+   stdin prompt, `--output-format json` and `stream-json`) and records every
+   invocation, so the
    whole backend can be exercised with no credentials and no spend.
 """
 
@@ -114,10 +115,11 @@ Options:
   --append-system-prompt <prompt>
   --disable-slash-commands
   --effort <level>
+  --include-partial-messages
   --max-budget-usd <amount>
   --model <model>
   --no-session-persistence
-  --output-format <format>
+  --output-format <format>              "text", "json", or "stream-json"
   --permission-prompts <target>
   -p, --print
   --setting-sources <sources>
@@ -125,6 +127,7 @@ Options:
   --system-prompt <prompt>
   --tools <tools...>
   (context via: --system-prompt[-file], --append-system-prompt[-file])
+  --verbose
   -v, --version
 __EXTRA_HELP__
 Commands:
@@ -174,6 +177,7 @@ if "--help" in argv or "-h" in argv:
     sys.exit(0)
 
 if argv[:1] == ["auth"]:
+    time.sleep(float(os.environ.get("FAKE_AUTH_SLEEP", "0")))
     sys.stdout.write(os.environ.get("FAKE_AUTH_STATUS", json.dumps(
         {"loggedIn": True, "authMethod": "claude.ai", "subscriptionType": "pro",
          "email": "test@example.com"})))
@@ -183,30 +187,88 @@ prompt = sys.stdin.read()
 log(prompt)
 
 mode = os.environ.get("FAKE_CLAUDE_MODE", "ok")
+# `--output-format stream-json` gets one JSON event per line, shaped like the
+# real CLI's (checked against Claude Code 2.1.267): a system init, the raw API
+# stream events, the whole assistant message, then the same `result` object
+# that `--output-format json` prints on its own.
+streaming = ("--output-format" in argv
+             and argv[argv.index("--output-format") + 1] == "stream-json")
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def event(ev):
+    emit({"type": "stream_event", "event": ev})
+
+
+def finish(payload):
+    if streaming:
+        emit(payload)
+    else:
+        sys.stdout.write(json.dumps(payload))
+    sys.exit(0)
+
+
+def write_answer(text):
+    event({"type": "content_block_start", "index": 1,
+           "content_block": {"type": "text", "text": ""}})
+    for word in text.split(" "):
+        event({"type": "content_block_delta", "index": 1,
+               "delta": {"type": "text_delta", "text": word + " "}})
+
+
+if streaming and mode not in ("not_json", "hang"):
+    emit({"type": "system", "subtype": "init", "tools": [], "mcp_servers": []})
+    event({"type": "message_start", "message": {"role": "assistant"}})
+    event({"type": "content_block_start", "index": 0,
+           "content_block": {"type": "thinking", "thinking": ""}})
+    event({"type": "content_block_delta", "index": 0,
+           "delta": {"type": "thinking_delta", "thinking": ""}})
 
 if mode == "slow":  # a long consult that does finish
     time.sleep(float(os.environ.get("FAKE_CLAUDE_SLEEP", "3")))
     mode = "ok"
 
+if mode == "trickle":  # a long answer that keeps streaming the whole time
+    stop = time.monotonic() + float(os.environ.get("FAKE_CLAUDE_SLEEP", "3"))
+    event({"type": "content_block_start", "index": 1,
+           "content_block": {"type": "text", "text": ""}})
+    while time.monotonic() < stop:
+        event({"type": "content_block_delta", "index": 1,
+               "delta": {"type": "text_delta", "text": "more words here "}})
+        time.sleep(float(os.environ.get("FAKE_CLAUDE_TICK", "0.3")))
+    mode = "ok"
+
 if mode == "hang":
+    time.sleep(600)
+elif mode == "stall":  # started answering, then went silent
+    write_answer("partial")
     time.sleep(600)
 elif mode == "auth_fail":
     sys.stderr.write("Invalid API key · Please run /login")
     sys.exit(1)
 elif mode == "usage_limit":
-    sys.stdout.write(json.dumps({
+    finish({
         "type": "result", "subtype": "error_during_execution", "is_error": True,
-        "result": "Claude AI usage limit reached. Your limit will reset at 5pm."}))
-    sys.exit(0)
+        "result": "Claude AI usage limit reached. Your limit will reset at 5pm."})
 elif mode == "is_error":
-    sys.stdout.write(json.dumps({
+    finish({
         "type": "result", "subtype": "error_during_execution", "is_error": True,
-        "result": "something exploded"}))
-    sys.exit(0)
+        "result": "something exploded"})
+elif mode == "error_list":  # error results carry `errors`, not `result`
+    finish({
+        "type": "result", "subtype": "error_during_execution", "is_error": True,
+        "errors": ["API Error: 529 Overloaded. Try again shortly."]})
+elif mode == "over_budget":
+    finish({
+        "type": "result", "subtype": "error_max_budget_usd", "is_error": True,
+        "total_cost_usd": 0.26, "errors": []})
 elif mode == "empty":
-    sys.stdout.write(json.dumps({
-        "type": "result", "subtype": "success", "is_error": False, "result": ""}))
-    sys.exit(0)
+    finish({
+        "type": "result", "subtype": "success", "is_error": False, "result": ""})
 elif mode == "not_json":
     sys.stdout.write("plain text answer, no JSON here")
     sys.exit(0)
@@ -215,9 +277,16 @@ elif mode == "crash":
     sys.exit(3)
 else:
     model = argv[argv.index("--model") + 1] if "--model" in argv else "?"
-    sys.stdout.write(json.dumps({
+    answer = "FAKE ANSWER for model=" + model
+    if streaming:
+        write_answer(answer)
+        event({"type": "content_block_stop", "index": 1})
+        event({"type": "message_stop"})
+        emit({"type": "assistant", "message": {
+            "role": "assistant", "content": [{"type": "text", "text": answer}]}})
+    finish({
         "type": "result", "subtype": "success", "is_error": False,
-        "result": "FAKE ANSWER for model=" + model,
+        "result": answer,
         "total_cost_usd": 0.01,
         "duration_ms": 1500,
         "usage": {"input_tokens": 1200, "output_tokens": 340,
@@ -227,8 +296,7 @@ else:
             "inputTokens": 1200, "outputTokens": 340,
             "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0,
             "costUSD": 0.01}},
-    }))
-    sys.exit(0)
+    })
 '''
 
 

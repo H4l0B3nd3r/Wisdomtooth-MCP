@@ -1,0 +1,39 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} · py${{ matrix.python }} · ${{ matrix.mcp }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both MCP SDK majors on every OS we ship for: `uv tool install` gets
+        # 2.x, while existing installs are still on 1.x. The oldest and newest
+        # supported Pythons bracket the rest. macOS runs once -- its minutes
+        # cost ten times Linux's on a private repository.
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.13"]
+        mcp: ["mcp>=1.12,<2", "mcp>=2"]
+        include:
+          - os: macos-latest
+            python: "3.13"
+            mcp: "mcp>=2"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . "${{ matrix.mcp }}" pytest pytest-asyncio anyio
+      - name: Test
+        run: python -m pytest -q

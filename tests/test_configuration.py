@@ -281,6 +281,10 @@ def test_state_dir_is_the_only_place_that_names_the_directory(server):
     meaning this directory: the Anthropic SDK's `~/.config/anthropic`, and the
     neutral fallback cwd for the CLI subprocess.
     """
-    source = Path(server().__file__).read_text(encoding="utf-8")
+    # Across the whole package: the directory is named in config.py now, and a
+    # second module joining the name itself is exactly the bug to catch.
+    package = Path(server().__file__).parent
+    source = "".join(p.read_text(encoding="utf-8")
+                     for p in sorted(package.glob("*.py")))
     assert source.count('".wisdomtooth"') == 1
     assert source.count('".claude-advisor"') == 1

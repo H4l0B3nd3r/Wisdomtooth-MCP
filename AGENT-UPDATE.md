@@ -1,5 +1,53 @@
 # AGENT-UPDATE.md — Migration playbook
 
+## 0.10.0 — hangs caught in minutes, trimmed answers, HTTP auth, `doctor`
+
+**Nothing to change for a stdio config.** HTTP setups: see "HTTP auth".
+
+- **A stalled consult stops after 5 minutes of silence**, not at the one-hour
+  wall clock. The server reads the CLI's `stream-json` output line by line
+  (`--verbose --include-partial-messages`). A working consult streams
+  something every few seconds, even while it thinks, so
+  `ADVISOR_IDLE_TIMEOUT` (300s) without output means a stall. The wall-clock
+  limit stays as the backstop, and a CLI too old to stream falls back to
+  `json` and the wall clock.
+- **Heartbeats say what Claude is doing:** "Claude is still working (45s
+  elapsed, writing, ~320 words so far)", or "thinking".
+- **Answers far over the budget are trimmed for the caller.** Past 1.5× the
+  answer budget the caller gets the lead — ending between paragraphs, code
+  fences closed — and a note pointing to the transcript, which keeps the whole
+  answer. `ADVISOR_TRIM_ANSWERS=0` turns it off; nothing is trimmed when
+  transcripts are off.
+- **HTTP auth.** `ADVISOR_HTTP_TOKEN` makes every HTTP request carry
+  `Authorization: Bearer <token>`. **Breaking, HTTP only:** a bind beyond
+  loopback (such as `ADVISOR_HOST=0.0.0.0` in Docker) without a token now
+  refuses to start. Set a token and put it in the client's `headers` (see
+  `kilo-configs/kilo.docker.jsonc`), or set `ADVISOR_HTTP_NO_AUTH=1` when a
+  proxy or firewall guards the port.
+- **`wisdomtooth-mcp doctor`** checks the CLI and login and prints a config
+  for Kilo, OpenCode, Claude Code, Claude Desktop, Cursor, Cline or Codex.
+  `wisdomtooth-mcp --version` prints the version.
+- **Fixes:** the MCP handshake no longer waits for `claude auth status` (the
+  startup banner ran it first, and Kilo gives a server 30s to connect); on
+  mcp 1.x, `advisor_status`, `advisor_models`, `advisor_configure` and
+  `advisor_usage` no longer block the event loop while they probe the CLI; a
+  malformed number in an env var or the config file falls back to its default
+  with a warning instead of stopping the server from starting; a CLI error
+  result reports its `errors` text rather than raw JSON, and a consult stopped
+  by `ADVISOR_MAX_BUDGET_USD` says so; the Docker image builds again (it was
+  missing README.md and LICENSE).
+- **Internals:** `server.py` is split into modules by concern — `config`,
+  `models`, `prompts`, `safety`, `usage`, `transcripts`, `claude_cli`,
+  `backends`, `httpauth`, `doctor` — and is now the composition root.
+  Settings are one frozen `Settings` object from `config.load_settings`.
+  Backends declare what they honour (`honours_max_tokens`, `fallback`, a
+  footer `label`), and the footer, `advisor_status` and `advisor_models` are
+  built from those declarations.
+- **CI:** GitHub Actions runs the suite on Linux and Windows × Python
+  3.10/3.13 × mcp 1.x/2.x, plus macOS.
+
+---
+
 ## 0.9.0 — usage ledger, server-read files, follow-ups, presets
 
 **Nothing to change for an existing config.** New behaviour, all server-side:

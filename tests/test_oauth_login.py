@@ -207,6 +207,9 @@ def test_a_successful_login_switches_the_active_backend(server, home,
     """_active_backend is cached; a fresh login has to invalidate it."""
     monkeypatch.setenv("FAKE_AUTH_STATUS", '{"loggedIn": false}')
     srv = server(ADVISOR_BACKEND="auto", ANTHROPIC_API_KEY="sk-ant-x")
+    # Without this the real console spawner ran: a stray window on Windows,
+    # and an early "no graphical session" return (so a failure) on Linux.
+    spawned(srv)
     assert srv._active_backend() == "api"
     states = [{"loggedIn": True, "authMethod": "claude.ai",
                "subscriptionType": "pro"}]

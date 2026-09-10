@@ -3,6 +3,37 @@
 Ordered roughly by how likely they are to bite. "Fixed in code" items are
 handled automatically; the rest need awareness or config.
 
+## Fixed in code (0.10.0) — know they exist, don't re-break them
+
+00000. **The CLI is read as a stream, and silence is the hang signal.**
+   `--output-format stream-json` needs `--verbose` in print mode, and
+   `--include-partial-messages` is what makes a long answer arrive in pieces;
+   without it the whole answer lands as one block at the end, which an idle
+   limit would mistake for a hang. `_STREAM_FEATURES` gates all three on the
+   `--help` probe. Measured against Claude Code 2.1.267, the longest gap
+   between lines was ~1.3s, thinking included (thinking arrives as
+   `thinking_delta` events even when their text is empty), so the 300s
+   `ADVISOR_IDLE_TIMEOUT` has a wide margin.
+00000a. **The `result` line is the object `--output-format json` prints.**
+   `StreamState.stdout()` passes it on unchanged, so parsing, usage and error
+   handling are shared by both formats. Error results carry `errors`, not
+   `result`.
+00000b. **Sync tools run in a worker thread.** mcp 1.x calls a plain `def`
+   tool on the event loop, so `tool()` registers those through an async
+   `to_thread` wrapper and leaves the module function unwrapped for tests.
+   `_active_backend()` probes the CLI, and a sync tool calling it used to
+   freeze every other request on 1.x.
+00000c. **The billing banner prints from a thread.** Resolving `auto` runs
+   `claude auth status` (up to 30s); doing that before `mcp.run()` could push
+   the handshake past Kilo's 30s connect timeout. `_BACKEND_LOCK` keeps the
+   banner and the first tool call from probing twice.
+00000d. **Trimming needs a transcript.** `_trim_to_budget` runs only when the
+   consult was saved, because the note sends the caller to that file for the
+   rest. The repeat guard stores the trimmed text, so a repeat matches it.
+00000e. **Settings parse leniently.** `config.load_settings` turns a malformed
+   number into its default plus a stderr warning. An `int()` at import used
+   to crash the server, which a client reports only as "failed to connect".
+
 ## Fixed in code (0.9.0) — know they exist, don't re-break them
 
 0000. **One system-prompt file per consult, deleted afterwards.** A shared
@@ -217,10 +248,12 @@ handled automatically; the rest need awareness or config.
    `advisor_configure` > environment variable > `~/.wisdomtooth/config.json`
    > built-in default. `ADVISOR_LOCK=1` inverts the top two away: per-call and
    runtime changes are rejected and the configured defaults always win.
-11. **HTTP transport has NO auth.** `ADVISOR_TRANSPORT=http` on
-    `0.0.0.0` lets anyone on the network spend your tokens/subscription.
-    Keep it on `127.0.0.1` (default) or put it behind a reverse proxy with
-    auth. Never port-forward it.
+11. **HTTP beyond loopback needs a token.** With `ADVISOR_HTTP_TOKEN` set,
+    every request must carry `Authorization: Bearer <token>`. On a
+    non-loopback host without one the server refuses to start (exit 2) unless
+    `ADVISOR_HTTP_NO_AUTH=1` says a proxy or firewall guards the port. Even
+    with a token, publish a container port to `127.0.0.1` only, and never
+    port-forward it.
 11a. **`uv tool install --force` can install a STALE build.** uv caches the
     built wheel keyed on the project version, so re-installing after a source
     edit that did not bump `version` in `pyproject.toml` silently reinstalls
@@ -287,7 +320,9 @@ handled automatically; the rest need awareness or config.
 15. **`deep` + `max` latency.** An Opus consult at high effort on a large
     question can legitimately take many minutes. That's expected, not a hang:
     the kill timeout is sized to the consult (up to `ADVISOR_TIMEOUT_MAX`) and
-    progress heartbeats keep the client waiting. Don't cancel it and re-issue — you pay for
+    progress heartbeats keep the client waiting. What does get stopped early is
+    a CLI that streams nothing for `ADVISOR_IDLE_TIMEOUT` (300s): that is a
+    stall, not a slow answer. Don't cancel it and re-issue — you pay for
     the cancelled one too on the API backend.
 
 ## Testing the server by hand (don't create false negatives)

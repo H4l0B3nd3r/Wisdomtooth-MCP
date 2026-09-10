@@ -94,6 +94,9 @@ advice they paid for. After a consult:
 - Do not silently replace the answer with your own two-sentence summary. Say
   what you are going to do with the advice, and point at the file for the rest.
 - If you disagree with the advice, say so and say why — but still surface it.
+- An answer that ends in `[trimmed: ...]` ran far past the length budget, so
+  you got only its lead. The rest is in the `[saved: ...]` file; read it there
+  if you need it. Do not ask the same question again to get the rest.
 
 ## Safety & discipline
 
@@ -128,8 +131,13 @@ never repeat it back, quote it, or write it into a file or commit message.
 
 Do not call `advisor_login` speculatively — only when credentials are actually
 missing or billing the wrong account. It opens a window on the user's screen.
+
+## Long consults
+
 - A `deep` consult at high effort on a large question can take many minutes;
   that is normal — the server keeps the call alive with progress updates. Do
   not cancel and re-issue.
+- A consult that reports the CLI "went silent" was stopped as stalled. Tell
+  the user; do not retry in a loop.
 - If advice fails to unblock you twice on the same problem, stop escalating
   to the advisor and ask the user.

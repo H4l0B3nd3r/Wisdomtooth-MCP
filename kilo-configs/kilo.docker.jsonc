@@ -13,11 +13,14 @@
       "enabled": true,
       "timeout": 300000
     }
-    // Option B: persistent container, remote transport. First run:
-    //   docker run -d --name wisdomtooth -p 8484:8484 \
+    // Option B: persistent container, remote transport. Binding beyond
+    // localhost needs a bearer token -- the server refuses to start without
+    // one, since anyone who can reach the port could spend the key. First run:
+    //   docker run -d --name wisdomtooth -p 127.0.0.1:8484:8484 \
     //     -e ADVISOR_BACKEND=api -e ANTHROPIC_API_KEY=sk-ant-... -e ADVISOR_TRANSPORT=http \
-    //     -e ADVISOR_HOST=0.0.0.0 wisdomtooth-mcp
+    //     -e ADVISOR_HOST=0.0.0.0 -e ADVISOR_HTTP_TOKEN=<a long random string> wisdomtooth-mcp
     // then use:
-    // "wisdomtooth": { "type": "remote", "url": "http://localhost:8484/mcp", "enabled": true }
+    // "wisdomtooth": { "type": "remote", "url": "http://localhost:8484/mcp", "enabled": true,
+    //                  "headers": { "Authorization": "Bearer <the same token>" } }
   }
 }
