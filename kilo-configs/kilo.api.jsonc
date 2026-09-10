@@ -1,0 +1,20 @@
+// API CREDITS ONLY — bills your Anthropic Console account per token, NOT your
+// Pro/Max subscription. Use this only if you have no Claude subscription, or
+// you deliberately want spend to land on the developer account.
+{
+  "mcp": {
+    "claude-advisor": {
+      "type": "local",
+      "command": ["claude-advisor-mcp"],
+      "environment": {
+        "ADVISOR_BACKEND": "api",
+        "ANTHROPIC_API_KEY": "sk-ant-your-key-here",
+        "ADVISOR_MODEL": "deep",
+        "ADVISOR_EFFORT": "high",
+        "ADVISOR_MAX_TOKENS": "16000"
+      },
+      "enabled": true,
+      "timeout": 300000
+    }
+  }
+}

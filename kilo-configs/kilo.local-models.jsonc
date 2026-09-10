@@ -1,0 +1,44 @@
+// RECOMMENDED FOR LOCAL MODELS (LM Studio / Ollama / llama.cpp driving Kilo).
+//
+// Two settings here exist because the consumer is a small model, and they are
+// the difference between this tool helping and hurting:
+//
+//   ADVISOR_MINIMAL_TOOLS  advertises only ask_claude + advisor_status.
+//                          Tool schemas are charged against the local model's
+//                          context on EVERY turn: ~3340 tokens with all 10
+//                          tools, ~1090 with two. On an 8k window that is 41%
+//                          vs 13%. A shorter list also improves tool-selection
+//                          accuracy. The operator tools still work -- flip this
+//                          to "0" for a session when you need them.
+//
+//   ADVISOR_ANSWER_BUDGET  target answer length in words. Claude's reply lands
+//                          INSIDE the local model's context, and an unbounded
+//                          answer can exceed a small model's whole window.
+//                          Enforced via the system prompt, which is the only
+//                          lever that works on the subscription backend --
+//                          ADVISOR_MAX_TOKENS is API-backend only.
+{
+  "mcp": {
+    "claude-advisor": {
+      "type": "local",
+      "command": ["claude-advisor-mcp"],
+      "environment": {
+        // Subscription only. Never silently spends API credits.
+        "ADVISOR_BACKEND": "claude-code",
+
+        // Sized for a small caller.
+        "ADVISOR_MINIMAL_TOOLS": "1",
+        "ADVISOR_ANSWER_BUDGET": "500",
+
+        // Sonnet by default: a local model escalates often, and Opus on every
+        // consult exhausts a Pro plan's headless quota. The agent can still
+        // pass model="deep" per call for the hard ones.
+        "ADVISOR_MODEL": "balanced",
+        "ADVISOR_EFFORT": "high"
+      },
+      "enabled": true,
+      // Must exceed ADVISOR_TIMEOUT (default 180s).
+      "timeout": 300000
+    }
+  }
+}

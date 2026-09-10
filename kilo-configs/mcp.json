@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "claude-advisor": {
+      "command": "claude-advisor-mcp",
+      "args": [],
+      "env": {
+        "ADVISOR_BACKEND": "auto",
+        "ADVISOR_MODEL": "deep"
+      },
+      "disabled": false,
+      "alwaysAllow": []
+    }
+  }
+}

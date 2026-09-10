@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments (this project keeps one per MCP SDK major, for the
+# cross-version test runs described in GOTCHAS.md)
+.venv/
+.venv-*/
+
+# Test + tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local consult transcripts, if a user points ADVISOR_CONSULT_DIR into the repo
+consults/
