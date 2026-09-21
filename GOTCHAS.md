@@ -3,6 +3,42 @@
 Ordered roughly by how likely they are to bite. "Fixed in code" items are
 handled automatically; the rest need awareness or config.
 
+## Fixed in code (0.11.0) — know they exist, don't re-break them
+
+000000. **A tier the advisor does not define means its default model.**
+   `advisors.model_for` maps `fast` / `balanced` / `deep` through the advisor's
+   tiers, and an advisor without them (a local server) falls back to its own
+   `model`. The first real e2e sent the literal model name `"fast"` to
+   LM Studio, which answered with whatever was loaded, so it failed silently.
+000000a. **Local reasoning models think inline.** LM Studio returns Qwen's
+   reasoning as a leading `<think>…</think>` in `content`, not as
+   `reasoning_content`. `_THINK_BLOCK` strips one leading block before the
+   answer reaches the caller or the transcript; a `<think>` mentioned later in
+   the text is kept.
+000000b. **Provider keys are cleared in tests.** The developer's shell can
+   hold `OPENAI_API_KEY` (here it was an LM Studio key), and an unready-advisor
+   test then passes for the wrong reason, or a test spends a real key. The
+   autouse `no_provider_keys` fixture clears every preset's key variable.
+000000c. **Holding is evidence-based.** A consult is held only when a real
+   source says it will not fit: a declared allowance, a full plan window, a
+   learned cost per plan point, or OpenRouter credit. A busy plan with no
+   learned rate is not held, and rate-limit headers never hold, because they
+   refill within a minute. Don't turn these into guesses.
+000000d. **`multi_advisor` checks everything before sending anything**, and
+   then isolates failures: each advisor runs in its own thread with its own
+   copy of the context (`_USAGE` and the per-advisor child `Cancellation`),
+   and one advisor raising costs only its section.
+000000e. **The Claude plan meter comes from `rate_limit_event`.** Claude Code
+   2.1.x streams `{"type": "rate_limit_event", "rate_limit_info":
+   {"unifiedWindows": {"five_hour": {"utilization", "resetsAt"}, "seven_day":
+   ...}}}`. `StreamState` keeps it and passes it on inside the `result` object
+   as `rate_limit_info`. Only the `stream-json` path sees it; a CLI too old to
+   stream gives no plan meter, and that is not a bug.
+000000f. **The Gemini CLI is not a backend.** Its personal Google-account
+   login answers third-party clients with `IneligibleTierError: This client
+   is no longer supported for Gemini Code Assist for individuals`. Gemini goes
+   through the AI Studio API key and the OpenAI-compatible endpoint.
+
 ## Fixed in code (0.10.0) — know they exist, don't re-break them
 
 00000. **The CLI is read as a stream, and silence is the hang signal.**

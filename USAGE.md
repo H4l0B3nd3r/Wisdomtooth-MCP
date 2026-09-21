@@ -11,8 +11,9 @@ sharp edges see `GOTCHAS.md`.
 Your local coding agent — a Qwen, Gemma, or similar model in Kilo Code, Cursor,
 or Cline — gets stuck. Instead of guessing from training data that may be a year
 old, it asks a frontier model one focused question and gets an expert answer
-back. That model is Claude today; the name is model-neutral because other
-providers are on the roadmap, but none are wired up yet.
+back. That model is Claude by default. You can connect others alongside it
+(ChatGPT, Gemini, OpenRouter, or a local model) and let the agent ask one of
+them, or two or three at once. See "Other advisors" below.
 
 **It spends your Claude subscription, not API credits.** Consults run through
 your logged-in Claude Code CLI, so a Pro or Max plan covers them at no
@@ -255,6 +256,46 @@ project folder rather than your home folder) and refuses `.env`, key files,
 Pass the file name from a previous `[saved: ...]` line as `follow_up_of`, and
 the advisor sees its earlier question and answer again — useful when the first
 answer raised a question of its own.
+
+### Other advisors
+
+Claude stays the default. To add another advisor, ask your agent in plain
+words, for example "connect my Gemini key AIza…" or "add my LM Studio model
+as an advisor". It calls `advisor_connect`, which checks the key and the
+endpoint and saves the advisor. The advisor works at once, with no restart.
+
+| Provider | What you need |
+|---|---|
+| `openai` (ChatGPT) | an OpenAI API key (platform.openai.com). A ChatGPT Plus subscription is not an API key |
+| `gemini` | a Gemini API key from Google AI Studio. The Gemini CLI's free Google-account login no longer works for third-party clients |
+| `openrouter` | an OpenRouter key; its credit balance is shown in `advisor_status` |
+| `lmstudio` / `ollama` | the local server running with a model loaded. Check the port: LM Studio can run on a port other than 1234 |
+
+Your agent can then:
+
+- **ask one advisor**: `advisor="gemini"` on `ask_wisdomtooth`, `review_code`
+  or `compare_approaches`;
+- **ask two or three at once** with `multi_advisor`, either the same question
+  to each, to compare the answers, or a different question to each
+  (`targeted_questions`), for example a technical question to Claude, a UI/UX
+  question to Gemini and a code review to ChatGPT.
+
+Each advisor bills its own account, and the footer names which one paid.
+`advisor_configure(advisor="gemini")` makes another advisor the default for
+this session; `default_advisor` in the config file makes it permanent.
+
+### How much is left, and when it asks you first
+
+`advisor_status` shows what each account has left. For your Claude plan, that
+is the plan's own 5-hour and 7-day meter, as Claude Code reports it. For
+OpenRouter, it is the key's credit. For OpenAI and Gemini, which do not
+publish a balance, declare an allowance yourself, for example
+`"allowance_tokens": 2000000, "allowance_window": "month"` on that advisor.
+
+If a request would cost more than the account has left, it is **held**:
+nothing is sent, and your agent must ask you whether to go ahead. If you say
+yes, it sends it again with `confirm_over_limit=true`. A balance that is merely
+low does not interrupt you; the answer's footer says `LOW` instead.
 
 ---
 

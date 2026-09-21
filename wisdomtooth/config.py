@@ -90,6 +90,11 @@ CONFIG_KEYS = {
     "repeat_window": "ADVISOR_REPEAT_WINDOW",
     "file_roots": "ADVISOR_FILE_ROOTS",
     "show_support": "ADVISOR_SHOW_SUPPORT",
+    # Advisors other than Claude, and which one a plain consult goes to.
+    "advisors": "ADVISOR_ADVISORS_JSON",
+    "default_advisor": "ADVISOR_DEFAULT_ADVISOR",
+    "advisors_file": "ADVISOR_ADVISORS_FILE",
+    "accounts_file": "ADVISOR_ACCOUNTS_FILE",
 }
 
 # Caller presets: one setting instead of several, sized by the CALLING model's
@@ -235,6 +240,8 @@ class Settings:
     max_tokens: int = 64000
     locked: bool = False
     tiers: Mapping = field(default_factory=dict)
+    # "claude" unless the user picked another advisor.
+    default_advisor: str = "claude"
 
 
 def _tiers(raw, warn) -> dict:
@@ -304,4 +311,6 @@ def load_settings(environ: Optional[Mapping] = None,
                               MAX_TOKENS_CEILING)),
         locked=src.flag("lock", False),
         tiers=_tiers(src.raw("tiers"), warn),
+        default_advisor=src.text("default_advisor", "claude").lower()
+        or "claude",
     )

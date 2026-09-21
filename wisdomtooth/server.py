@@ -5,10 +5,10 @@ Exposes a frontier model as an *escalation* advisor over MCP. Other agents
 their own attempts and doc lookups (e.g. Context7) have not resolved the
 problem.
 
-Claude is the model behind it today and stays the default. The name is
-model-neutral on purpose: `backends.Backend` is the seam another provider
-would slot into. Nothing in the tool surface assumes Anthropic -- but nothing
-else is implemented yet either, so every consult currently goes to Claude.
+Claude is the default advisor. Others can be connected alongside it --
+ChatGPT, Gemini, OpenRouter, or a local model in LM Studio or Ollama, anything
+that speaks the OpenAI chat-completions protocol -- and chosen per consult
+with `advisor=`, or asked together with `multi_advisor`.
 
 Billing, in one line: by default the server uses the user's Claude
 subscription via the local Claude Code CLI, and only falls back to
@@ -26,6 +26,9 @@ and takes what it needs as arguments:
   transcripts  the saved Markdown consults and their resource links
   claude_cli   running the CLI: processes, cancellation, streamed output
   backends     the provider seam
+  advisors     the named advisors, provider presets, the advisor store
+  openai_compat the OpenAI chat-completions client every non-Claude advisor uses
+  accounts     what each connected account has left (plan meter, credit)
   httpauth     bearer-token auth for the HTTP transport
   doctor       the `wisdomtooth-mcp doctor` command
 
@@ -47,6 +50,7 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import anthropic
@@ -64,8 +68,8 @@ except ImportError:  # mcp 1.x
 
 from mcp.types import ToolAnnotations
 
-from . import (claude_cli, config, doctor, httpauth, models, prompts, safety,
-               transcripts, usage)
+from . import (accounts, advisors, claude_cli, config, doctor, httpauth, models,
+               openai_compat, prompts, safety, transcripts, usage)
 from .backends import Backend
 from .claude_cli import CANCELLATION as _CANCELLATION
 from .claude_cli import Cancellation as _Cancellation
@@ -74,7 +78,8 @@ from .claude_cli import parse_output as _parse_cli_output
 from .claude_cli import spawn_login_console as _spawn_login_console
 from .claude_cli import wrap_for_windows as _wrap_for_windows  # noqa: F401
 from .config import CONFIG_KEYS, PRESETS, DEFAULT_PRESET  # noqa: F401
-from .errors import AdvisorError, AdvisorInputError, UsageLimitError
+from .errors import (AdvisorError, AdvisorInputError, OverLimitError,
+                     UsageLimitError)
 from .models import (CLAUDE_CODE_ALIASES, FALLBACK_BETA, MAX_TOKENS_CEILING,
                      MODEL_CAPS, VALID_EFFORT)
 
@@ -317,6 +322,9 @@ LOCAL_ANNOTATIONS = ToolAnnotations(
 )
 
 
+_TOOL_NAMES: list = []  # what this process advertises
+
+
 def tool(title: str, annotations: ToolAnnotations):
     """Register a function as an MCP tool, honouring ADVISOR_MINIMAL_TOOLS.
 
@@ -332,6 +340,7 @@ def tool(title: str, annotations: ToolAnnotations):
     def decorate(fn):
         if MINIMAL_TOOLS and fn.__name__ not in ESSENTIAL_TOOLS:
             return fn
+        _TOOL_NAMES.append(fn.__name__)
         target = fn
         if not inspect.iscoroutinefunction(fn):
             @functools.wraps(fn)
@@ -780,12 +789,31 @@ def _usage_report(days: int = 7) -> str:
     now = time.time()
     where = (_usage_path() if USAGE_LOG
              else "disabled (ADVISOR_USAGE_LOG=0), so this server process only")
+    records = _usage_records(now - max(days, 7) * 86400)
+    by_advisor: dict = {}
+    for r in records:
+        if float(r["ts"]) >= now - days * 86400 and r.get("status") == "ok":
+            by_advisor.setdefault(r.get("advisor") or advisors.CLAUDE,
+                                  []).append(r)
+    sections = [f"BY ADVISOR, last {days} day(s):"]
+    if not by_advisor:
+        sections.append("  (no consults)")
+    for name, rows in sorted(by_advisor.items()):
+        s = _summarise(rows)
+        sections.append(
+            f"  {name:<22} {s['consults']:>4} consults  "
+            f"{_fmt_tokens(s['input'])} in / {_fmt_tokens(s['output'])} out"
+            + (f"  ≈{_fmt_usd(s['cost'])}" if s["cost"] is not None else ""))
+    balances = _balance_lines()
+    sections += ["", "BALANCES:"] + (["  " + b for b in balances] or [
+        "  none reported yet"])
     return usage.report(
-        _usage_records(now - max(days, 7) * 86400), now, days, where,
+        records, now, days, where,
         _caps_description() or "none set (ADVISOR_MAX_CONSULTS_PER_HOUR / "
                                "_5H / _WEEK, ADVISOR_MAX_USD_PER_DAY)",
         f"identical consults within {REPEAT_WINDOW_S / 60:g} min return the "
-        "saved answer at no cost" if REPEAT_WINDOW_S else "off")
+        "saved answer at no cost" if REPEAT_WINDOW_S else "off",
+        sections=sections)
 
 
 # ---------------------------------------------------------------------------
@@ -1071,6 +1099,8 @@ def _consult_claude_code(system: str, user_content: str, model: str,
     if payload:
         # Before the failure checks: a failed run can still have been billed.
         _note_usage(**_cli_usage(payload, model))
+        # The plan's own meter, when the CLI streamed one.
+        _note_usage(rate_limit_info=payload.get("rate_limit_info"))
     failed = result.returncode != 0 or (payload or {}).get("is_error")
 
     if failed:
@@ -1373,20 +1403,10 @@ if BACKEND != "auto" and BACKEND not in _BACKENDS:
           "registers it, the server behaves as `auto`.", file=sys.stderr)
 
 
-def _consult(question: str, context: str = "", extra_system: str = "",
-             model: str = "", effort: str = "", max_tokens: int = 0,
-             scrub_context: bool = True, kind: str = "consult",
-             saved: Optional[dict] = None,
-             context_files: Optional[list] = None,
-             follow_up_of: str = "") -> str:
-    """One stateless consult, on whichever backend is active.
-
-    `kind` names the calling tool, for the transcript. `saved` is an optional
-    out-parameter: pass a dict and the transcript path lands in it under
-    "path", so the tool wrapper can attach a `resource_link` to the same file.
-    An out-parameter rather than a richer return type because the answer string
-    IS this function's contract -- every caller, and most of the test suite,
-    treats it as one.
+def _prepare(question: str, context: str = "", extra_system: str = "",
+             scrub_context: bool = True, context_files: Optional[list] = None,
+             follow_up_of: str = "") -> tuple:
+    """(system prompt, question, user content) for one consult.
 
     `follow_up_of` re-sends an earlier saved exchange and `context_files` are
     read by the server itself. Both land in `context`, so both pass through the
@@ -1404,20 +1424,64 @@ def _consult(question: str, context: str = "", extra_system: str = "",
     context = _sanitize(context, scrub=scrub_context) if context else context
     user_content = question if not context else (
         f"<context>\n{context}\n</context>\n\n{question}")
+    return system, question, user_content
 
-    model = _resolve_model(model)
-    effort = _resolve_effort(effort)
-    backend = _active_backend()
 
-    if backend == "unavailable":
-        raise AdvisorError(_NO_CREDENTIALS)
+def _route(spec, model: str, effort: str) -> tuple:
+    """(model, effort, backend name) for a consult on `spec`, or raise."""
+    if spec.kind == "claude":
+        backend = _active_backend()
+        if backend == "unavailable":
+            raise AdvisorError(_NO_CREDENTIALS)
+        return _resolve_model(model), _resolve_effort(effort), backend
+    ready, why = _advisor_ready(spec.name)
+    if not ready:
+        raise AdvisorError(f"advisor {spec.name!r} ({spec.label}) is not "
+                           f"ready: {why}. Nothing was sent.")
+    return _advisor_model(spec, model), _resolve_effort(effort), spec.provider
 
-    key = _repeat_key(kind, backend, model, effort, max_tokens, system,
-                      user_content)
+
+def _note_plan(spec, record: dict) -> None:
+    """Hand the plan meter the CLI reported to the account meter."""
+    info = record.pop("rate_limit_info", None)
+    if info and spec.kind == "claude" and record.get("backend") == "claude-code":
+        _METER.note_plan(spec.name, info, record.get("cost_usd"))
+
+
+def _consult(question: str, context: str = "", extra_system: str = "",
+             model: str = "", effort: str = "", max_tokens: int = 0,
+             scrub_context: bool = True, kind: str = "consult",
+             saved: Optional[dict] = None,
+             context_files: Optional[list] = None,
+             follow_up_of: str = "", advisor: str = "",
+             confirm_over_limit: bool = False,
+             held_already: bool = False) -> str:
+    """One stateless consult, on the named advisor (the default if empty).
+
+    `kind` names the calling tool, for the transcript. `saved` is an optional
+    out-parameter: pass a dict and the transcript path lands in it under
+    "path", so the tool wrapper can attach a `resource_link` to the same file.
+    An out-parameter rather than a richer return type because the answer string
+    IS this function's contract -- every caller, and most of the test suite,
+    treats it as one.
+
+    A consult that would cost more than its account has left is held
+    (OverLimitError) unless `confirm_over_limit`; `held_already` says a
+    multi-advisor caller has checked every account at once.
+    """
+    spec = _advisor_spec(advisor)
+    system, question, user_content = _prepare(question, context, extra_system,
+                                              scrub_context, context_files,
+                                              follow_up_of)
+    model, effort, backend = _route(spec, model, effort)
+
+    key = _repeat_key(kind, spec.name, backend, model, effort, max_tokens,
+                      system, user_content)
     hit = _recall(key)
     if hit:
         _append_usage(_usage_record(kind, backend, model, effort, "repeat",
-                                    user_content, transcript=hit["path"]))
+                                    user_content, transcript=hit["path"],
+                                    advisor=spec.name))
         if saved is not None:
             saved["path"] = hit["path"]
         return (hit["answer"] + hit["footer"]
@@ -1427,23 +1491,32 @@ def _consult(question: str, context: str = "", extra_system: str = "",
                 "afresh, change the question or add what is new to "
                 "`context`.]")
     _check_caps()
+    if not held_already:
+        _hold_if_over([dict(spec=spec, model=model, effort=effort,
+                            backend=backend, max_tokens=max_tokens,
+                            system=system, user_content=user_content)],
+                      confirm_over_limit, kind)
 
-    record = _usage_record(kind, backend, model, effort, "ok", user_content)
+    record = _usage_record(kind, backend, model, effort, "ok", user_content,
+                           advisor=spec.name)
     token = _USAGE.set(record)
     started = time.monotonic()
     try:
         answer, footer = _consult_backend(system, user_content, model, effort,
-                                          max_tokens, backend)
+                                          max_tokens, backend, spec)
     except Exception as exc:
         record.update(status="error", error=exc.__class__.__name__,
                       duration_s=round(time.monotonic() - started, 1))
+        _note_plan(spec, record)
         _append_usage(record)
         raise
     finally:
         _USAGE.reset(token)
+    _note_plan(spec, record)
     record.update(duration_s=round(time.monotonic() - started, 1),
                   answer_chars=len(answer))
     footer += _usage_footer(record)
+    footer += _balance_footer(spec, record, confirm_over_limit)
 
     # The transcript keeps the whole answer; the caller may get only its lead.
     path = _save_consult(kind, question, user_content, answer, footer)
@@ -1474,8 +1547,12 @@ def _consult(question: str, context: str = "", extra_system: str = "",
 
 def _consult_backend(system: str, user_content: str, model: str,
                      effort: Optional[str], max_tokens: int,
-                     backend: str) -> tuple:
+                     backend: str, advisor=None) -> tuple:
     """Run one consult on `backend`; return (answer, billing footer)."""
+    if advisor is not None and advisor.kind == "openai":
+        answer = _consult_openai(advisor, system, user_content, model, effort,
+                                 max_tokens)
+        return answer, _openai_footer(advisor, model)
     spec = _BACKENDS[backend]
     try:
         answer = spec.consult(system, user_content, model, effort, max_tokens)
@@ -1506,14 +1583,786 @@ def _backends_line() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Advisors
+# ---------------------------------------------------------------------------
+# `claude` goes through the backends above. Every other advisor is an
+# OpenAI-compatible endpoint the user configured or connected; see advisors.py.
+
+def _warn(message: str) -> None:
+    print("[wisdomtooth] " + message, file=sys.stderr)
+
+
+def _advisors_path() -> str:
+    return os.path.abspath(str(_setting("advisors_file")
+                               or os.path.join(_state_dir(), "advisors.json")))
+
+
+def _accounts_path() -> str:
+    return os.path.abspath(str(_setting("accounts_file")
+                               or os.path.join(_state_dir(), "accounts.json")))
+
+
+_METER = accounts.Meter(_accounts_path)
+_ADVISORS: dict = {}
+_DEFAULT_ADVISOR = advisors.CLAUDE
+
+
+def _load_advisors() -> None:
+    """(Re)build the advisor registry from env, config file and store."""
+    global _ADVISORS, _DEFAULT_ADVISOR
+    store = advisors.read_store(_advisors_path(), _warn)
+    _ADVISORS = advisors.load(os.environ.get("ADVISOR_ADVISORS_JSON"),
+                              _FILE_CONFIG.get("advisors"),
+                              store.get("advisors"), _warn)
+    # An explicit setting beats the default advisor_connect stored.
+    explicit = (os.environ.get("ADVISOR_DEFAULT_ADVISOR")
+                or _FILE_CONFIG.get("default_advisor"))
+    choice = str(explicit or store.get("default") or advisors.CLAUDE)
+    choice = choice.strip().lower()
+    if choice not in _ADVISORS:
+        _warn(f"default advisor {choice!r} is not configured; using claude. "
+              f"Configured: {', '.join(_ADVISORS)}")
+        choice = advisors.CLAUDE
+    _DEFAULT_ADVISOR = choice
+
+
+_load_advisors()
+
+
+def _default_advisor() -> str:
+    name = _OVERRIDES.get("advisor") or _DEFAULT_ADVISOR
+    return name if name in _ADVISORS else advisors.CLAUDE
+
+
+def _advisor_choices() -> str:
+    return ", ".join(_ADVISORS)
+
+
+def _advisor_spec(name: str = "") -> advisors.AdvisorSpec:
+    key = str(name or "").strip().lower() or _default_advisor()
+    spec = _ADVISORS.get(key)
+    if spec is None:
+        raise AdvisorInputError(
+            f"no advisor named {name!r}. Connected: {_advisor_choices()}. To "
+            "add one, the user can call advisor_connect (provider openai, "
+            "gemini, openrouter, lmstudio, ollama or openai-compatible) or "
+            "add it to the config file's `advisors`.")
+    return spec
+
+
+def _advisor_key(spec: advisors.AdvisorSpec) -> str:
+    return advisors.key_for(spec, os.environ)
+
+
+def _advisor_ready(name: str) -> tuple:
+    """(ready, why) -- why is "ready" or what is missing."""
+    spec = _advisor_spec(name)
+    if spec.kind == "claude":
+        if _active_backend() == "unavailable":
+            return False, "no usable Claude credentials (run advisor_auth_check)"
+        return True, "ready"
+    if spec.needs_key and not _advisor_key(spec):
+        where = (f"set {spec.api_key_env} in the MCP server env, or "
+                 if spec.api_key_env else "")
+        return False, (f"no API key: {where}call advisor_connect with "
+                       f"name={spec.name!r} and api_key")
+    return True, "ready"
+
+
+def _advisor_model(spec: advisors.AdvisorSpec, model: str = "") -> str:
+    if spec.kind == "claude":
+        return _resolve_model(model)
+    if LOCKED or not model:
+        model = _OVERRIDES.get("advisor_models", {}).get(spec.name, "")
+    return advisors.model_for(spec, model)
+
+
+def _advisor_effort(spec: advisors.AdvisorSpec,
+                    effort: Optional[str]) -> Optional[str]:
+    if spec.kind == "claude":
+        return effort
+    return advisors.effort_for(spec, effort)
+
+
+def _short_billing(spec: advisors.AdvisorSpec) -> str:
+    if spec.local:
+        return "LOCAL MODEL (no per-token cost)"
+    return {"openai": "OPENAI API ACCOUNT", "gemini": "GEMINI API ACCOUNT",
+            "openrouter": "OPENROUTER CREDITS"}.get(
+        spec.provider, f"{spec.name.upper()} ACCOUNT")
+
+
+def _spec_cost(spec: advisors.AdvisorSpec, tokens_in: int, tokens_out: int,
+               cached: int = 0) -> Optional[float]:
+    if spec.prices is None:
+        return None
+    rate_in, rate_out = spec.prices
+    return round((tokens_in * rate_in + cached * rate_in * usage.CACHE_READ_FACTOR
+                  + tokens_out * rate_out) / 1_000_000, 6)
+
+
+def _openai_usage(spec: advisors.AdvisorSpec, raw: dict) -> dict:
+    def number(obj, key):
+        try:
+            return int((obj or {}).get(key) or 0)
+        except (TypeError, ValueError, AttributeError):
+            return 0
+    prompt = number(raw, "prompt_tokens")
+    cached = number(raw.get("prompt_tokens_details") if raw else None,
+                    "cached_tokens")
+    tokens = dict(input_tokens=max(0, prompt - cached),
+                  output_tokens=number(raw, "completion_tokens"),
+                  cache_read_tokens=cached, cache_write_tokens=0)
+    cost = _spec_cost(spec, tokens["input_tokens"], tokens["output_tokens"],
+                      cached)
+    return dict(tokens, cost_usd=cost,
+                cost_source="estimate" if cost is not None else None)
+
+
+_THINK_BLOCK = re.compile(r"\A\s*<(think|thinking)>.*?</\1>", re.DOTALL)
+
+# Parameters a compatible server may reject; dropped one at a time on a 400.
+_OPTIONAL_PARAMS = ("reasoning_effort", "max_completion_tokens", "max_tokens",
+                    "stream_options")
+
+
+def _consult_openai(spec: advisors.AdvisorSpec, system: str, user_content: str,
+                    model: str, effort: Optional[str], max_tokens: int) -> str:
+    """One consult on an OpenAI-compatible advisor."""
+    key = _advisor_key(spec)
+    body = {"model": model,
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": user_content}],
+            "stream": True, "stream_options": {"include_usage": True}}
+    sent_effort = advisors.effort_for(spec, effort)
+    if sent_effort:
+        body["reasoning_effort"] = sent_effort
+    if max_tokens and not LOCKED:
+        body[spec.max_tokens_param] = _resolve_max_tokens(max_tokens)
+    elif spec.send_max_tokens:
+        body[spec.max_tokens_param] = _effective_max_tokens()
+    _note_usage(sent_effort=sent_effort,
+                sent_max_tokens=body.get(spec.max_tokens_param))
+
+    url = spec.base_url + "/chat/completions"
+    timeout_s = _consult_timeout(len(system) + len(user_content), effort)
+    holder = _CANCELLATION.get()
+    dropped: list = []
+    who = f"advisor {spec.name!r} ({spec.label})"
+    while True:
+        try:
+            result = openai_compat.chat(url, key, body, timeout_s,
+                                        idle_s=IDLE_TIMEOUT, holder=holder)
+            break
+        except openai_compat.HTTPFailure as exc:
+            _METER.note_headers(spec.name, exc.headers)
+            if exc.status in (400, 422):
+                optional = [p for p in _OPTIONAL_PARAMS if p in body]
+                named = [p for p in optional if p in exc.message]
+                if optional:
+                    for param in named or optional:
+                        body.pop(param, None)
+                        dropped.append(param)
+                    continue
+            raise _openai_failure(spec, exc, model) from None
+        except openai_compat.Unreachable as exc:
+            raise AdvisorError(
+                f"Could not reach {who} at {spec.base_url} ({exc}). Is the "
+                "server running and the address right? For a local model, "
+                "start the server and load the model (LM Studio: `lms server "
+                "start`, then load it; Ollama: `ollama serve`). Nothing was "
+                "spent. Do NOT retry in a loop; tell the user.") from None
+        except openai_compat.Silent as exc:
+            raise AdvisorError(
+                f"{who} went silent: no data for {exc.idle_s:g}s, "
+                f"{exc.elapsed}s into the consult, so it was stopped. A local "
+                "model still loading, or a very long prompt on slow hardware, "
+                "can do this; otherwise it is a network or server stall. The "
+                "user can raise ADVISOR_IDLE_TIMEOUT. Do NOT retry in a loop."
+            ) from None
+        except openai_compat.WallClock as exc:
+            raise AdvisorError(
+                f"{who} was still answering after {exc.timeout_s:g}s and was "
+                "stopped (ADVISOR_TIMEOUT_MAX caps a consult). Lower the "
+                "answer budget or ask a narrower question.") from None
+        except openai_compat.Cancelled:
+            raise AdvisorError(
+                "The consult was cancelled by the client, and the HTTP stream "
+                f"to {spec.name} was closed.") from None
+    if dropped:
+        _note_usage(dropped_params=dropped)
+    _note_usage(**_openai_usage(spec, result.usage))
+    _METER.note_headers(spec.name, result.headers)
+    # Reasoning models on local servers often send their thinking inline, as
+    # a leading <think> block, rather than as reasoning_content.
+    answer = _THINK_BLOCK.sub("", result.text, count=1).strip()
+    if not answer:
+        if result.finish_reason == "length":
+            return ("[advisor returned no visible text -- it hit its token "
+                    "limit while reasoning. Lower effort or raise max_tokens, "
+                    "then retry ONCE.]")
+        raise AdvisorError(f"{who} returned an empty answer (finish reason: "
+                           f"{result.finish_reason or 'none'}).")
+    return answer
+
+
+def _openai_failure(spec, exc, model) -> AdvisorError:
+    who = f"advisor {spec.name!r} ({spec.label})"
+    detail = f"HTTP {exc.status}: {exc.message}"
+    if exc.status in (401, 403):
+        env = f" or set {spec.api_key_env}" if spec.api_key_env else ""
+        return AdvisorError(
+            f"AUTH FAILURE on {who}: the endpoint rejected the API key "
+            f"({detail}). The user must fix the key -- call advisor_connect "
+            f"with name={spec.name!r} and the right api_key{env}. Do not retry "
+            "until then.")
+    text = (exc.message + " " + exc.code).lower()
+    if exc.status == 429 and any(s in text for s in (
+            "quota", "insufficient", "billing", "credit", "exhausted")):
+        return UsageLimitError(
+            f"{who}'s account has no quota left ({detail}). This is not a bug "
+            "and retrying will not help -- do NOT retry; tell the user, who "
+            "can add credit or wait for the quota to reset. Other advisors "
+            "may still be available (advisor_status).")
+    if exc.status == 429:
+        wait = exc.headers.get("retry-after")
+        return AdvisorError(
+            f"{who} is rate-limited ({detail})."
+            + (f" The endpoint asks to wait {wait}s before the next request."
+               if wait else "")
+            + " Do not retry immediately.")
+    if exc.status == 404:
+        return AdvisorError(
+            f"{who}: {detail}. Either the model {model!r} does not exist on "
+            f"this endpoint or the base_url ({spec.base_url}) is wrong. "
+            "advisor_connect lists the models an endpoint offers.")
+    return AdvisorError(f"{who} failed ({detail}).")
+
+
+def _openai_footer(spec: advisors.AdvisorSpec, model: str) -> str:
+    record = _USAGE.get() or {}
+    parts = ["advisor: " + f"{spec.name}/{model}",
+             "billed to " + _short_billing(spec)]
+    if record.get("sent_effort"):
+        parts.append("effort=" + record["sent_effort"])
+    if record.get("sent_max_tokens"):
+        parts.append(f"max_tokens={record['sent_max_tokens']}")
+    if record.get("dropped_params"):
+        parts.append("the endpoint refused " + ", ".join(record["dropped_params"])
+                     + ", so it was dropped")
+    return "\n\n---\n[" + " · ".join(parts) + "]"
+
+
+# ---------------------------------------------------------------------------
+# Account balances, and holding a consult that would go over
+# ---------------------------------------------------------------------------
+
+# Rough tokens an effort level spends thinking before it answers.
+_THINKING_TOKENS = {"minimal": 200, "low": 1000, "medium": 2000,
+                    "high": 4000, "xhigh": 8000, "max": 16000}
+_TOKENS_PER_WORD = 1.4
+_LOW_SHARE = 0.2  # warn below this share of an allowance
+
+
+def _estimate_split(spec, system: str, user_content: str, max_tokens: int,
+                    effort: Optional[str]) -> tuple:
+    """(input, output) tokens a consult will probably use. Deliberately rough:
+    4 characters a token in, the answer budget plus thinking out."""
+    tokens_in = -(-(len(system) + len(user_content)) // 4)
+    words = _effective_answer_budget() or _UNBUDGETED_WORDS
+    tokens_out = int(words * _TOKENS_PER_WORD) + _THINKING_TOKENS.get(
+        (effort or "").lower(), 0)
+    if max_tokens and not LOCKED:
+        tokens_out = min(tokens_out, int(max_tokens))
+    return tokens_in, tokens_out
+
+
+def _estimate_tokens(spec, system: str, user_content: str, max_tokens: int,
+                     effort: Optional[str]) -> int:
+    return sum(_estimate_split(spec, system, user_content, max_tokens, effort))
+
+
+def _record_tokens(record: dict) -> int:
+    return sum(int(record.get(k) or 0) for k in (
+        "input_tokens", "cache_read_tokens", "cache_write_tokens",
+        "output_tokens"))
+
+
+def _allowance_used(spec, now: Optional[float] = None) -> int:
+    now = time.time() if now is None else now
+    since = now - spec.allowance_seconds
+    return sum(_record_tokens(r) for r in _billed(_usage_records(since))
+               if (r.get("advisor") or advisors.CLAUDE) == spec.name)
+
+
+def _clock(ts: float) -> str:
+    if ts - time.time() > 20 * 3600:
+        return time.strftime("%a %H:%M", time.localtime(ts))
+    return time.strftime("%H:%M", time.localtime(ts))
+
+
+def _fresh_credit(spec) -> dict:
+    """The key's credit, refetched when the last reading is stale."""
+    credit = _METER.credit(spec.name)
+    if credit and time.time() - float(credit.get("seen", 0)) < \
+            accounts.CREDIT_MAX_AGE_S:
+        return credit
+    try:
+        data = openai_compat.get_json(spec.base_url + "/key",
+                                      _advisor_key(spec), timeout_s=8)
+        info = data.get("data") if isinstance(data, dict) else None
+        if isinstance(info, dict):
+            _METER.note_credit(spec.name, info)
+    except Exception as exc:  # a balance check must never cost the consult
+        print(f"[wisdomtooth] could not read {spec.name}'s credit: {exc}",
+              file=sys.stderr)
+    return _METER.credit(spec.name)
+
+
+def _over_limit(ask: dict) -> list:
+    """Why `ask` would cost more than its account has left; [] if it fits."""
+    spec = ask["spec"]
+    tokens_in, tokens_out = _estimate_split(spec, ask["system"],
+                                            ask["user_content"],
+                                            ask["max_tokens"], ask["effort"])
+    total = tokens_in + tokens_out
+    problems = []
+    if spec.allowance_tokens and spec.allowance_seconds:
+        left = spec.allowance_tokens - _allowance_used(spec)
+        if total > left:
+            problems.append(
+                f"{spec.name}: this request needs ≈{total:,} tokens, but "
+                f"≈{max(left, 0):,} of its {spec.allowance_tokens:,}-token "
+                f"{spec.allowance_window} allowance are left (the allowance "
+                "the user declared, measured by the local ledger)")
+    if spec.kind == "claude" and ask["backend"] == "claude-code":
+        full = [w for w in _METER.plan_windows(spec.name) if w[1] >= 1.0]
+        if full:
+            label, util, resets = full[0]
+            problems.append(
+                f"{spec.name}: the Claude subscription's {label} window is at "
+                f"{round(util * 100)}% (resets {_clock(resets)}), so the plan "
+                "has nothing left for this request")
+        else:
+            left_usd = _METER.plan_remaining_usd(spec.name)
+            cost = usage.estimate_cost(_tier_or_id(ask["model"]), tokens_in,
+                                       tokens_out)
+            if left_usd is not None and cost is not None and cost > left_usd:
+                problems.append(
+                    f"{spec.name}: this request needs ≈{_fmt_usd(cost)} of "
+                    f"API-equivalent usage, but the subscription has "
+                    f"≈{_fmt_usd(left_usd)} left before its tightest window "
+                    "fills (measured from the plan's own meter)")
+    if spec.balance == "openrouter":
+        remaining = _fresh_credit(spec).get("remaining")
+        cost = _spec_cost(spec, tokens_in, tokens_out)
+        if remaining is not None and (remaining <= 0 or (
+                cost is not None and cost > remaining)):
+            problems.append(
+                f"{spec.name}: this request costs ≈"
+                + (_fmt_usd(cost) if cost is not None else "an unknown amount")
+                + f", but the key has {_fmt_usd(remaining)} of credit left")
+    return problems
+
+
+def _hold_if_over(asks: list, confirmed: bool, kind: str) -> None:
+    """Raise OverLimitError if any request would go over, unless confirmed.
+
+    Every account is checked before anything is sent, so a multi-advisor call
+    is held whole rather than half-spent.
+    """
+    problems = [p for ask in asks for p in _over_limit(ask)]
+    if not problems or confirmed:
+        return
+    for ask in asks:
+        _append_usage(_usage_record(kind, ask["backend"], ask["model"],
+                                    ask["effort"], "held", ask["user_content"],
+                                    advisor=ask["spec"].name))
+    raise OverLimitError(
+        "HELD -- nothing was sent and nothing was spent: this request would "
+        "cost more than the account has left.\n"
+        + "\n".join("  - " + p for p in problems)
+        + "\nAsk the user whether to go ahead anyway (it may be refused by "
+        "the provider, or run into overage or pay-per-token billing). If they "
+        "say yes, call the same tool again with the same arguments plus "
+        "confirm_over_limit=true. Do NOT set confirm_over_limit without "
+        "asking them. Estimates are rough (≈4 characters a token in, the "
+        "answer budget out).")
+
+
+def _plan_text(name: str, with_resets: bool = True) -> str:
+    parts = []
+    for label, util, resets in _METER.plan_windows(name):
+        text = f"{label} {round(util * 100)}% used"
+        if with_resets:
+            text += f" (resets {_clock(resets)})"
+        parts.append(text)
+    return ", ".join(parts)
+
+
+def _balance_footer(spec, record: dict, confirmed: bool) -> str:
+    """One line under the answer: what the account has left now."""
+    parts = []
+    if spec.kind == "claude":
+        plan = _plan_text(spec.name, with_resets=False)
+        if plan:
+            parts.append("plan: " + plan.replace(", ", " · "))
+    if spec.allowance_tokens and spec.allowance_seconds:
+        # The ledger does not hold this consult yet.
+        used = _allowance_used(spec) + _record_tokens(record)
+        left = spec.allowance_tokens - used
+        if left < 0:
+            parts.append(
+                f"balance: {spec.name} is over its {spec.allowance_tokens:,}-"
+                f"token {spec.allowance_window} allowance by ≈{-left:,}"
+                + (" -- sent with the user's confirmation" if confirmed else ""))
+        else:
+            share = left / spec.allowance_tokens
+            parts.append(
+                f"balance: ≈{left:,} of {spec.allowance_tokens:,} tokens left "
+                f"this {spec.allowance_window} ({int(share * 100)}% left)"
+                + (" -- LOW; tell the user" if share < _LOW_SHARE else ""))
+    limit = _METER.ratelimit(spec.name)
+    if limit.get("limit") and limit.get("remaining") is not None and \
+            limit["remaining"] < limit["limit"] * _LOW_SHARE:
+        parts.append(f"rate limit: {limit['remaining']:,} of "
+                     f"{limit['limit']:,} tokens/min left")
+    if spec.balance == "openrouter":
+        credit = _METER.credit(spec.name)
+        if credit.get("remaining") is not None:
+            parts.append(f"credit: {_fmt_usd(credit['remaining'])} left")
+    return ("\n[" + " · ".join(parts) + "]") if parts else ""
+
+
+def _balance_lines() -> list:
+    """What every connected account has left, for status and usage."""
+    lines = []
+    for name, spec in _ADVISORS.items():
+        if spec.kind == "claude":
+            plan = _plan_text(name)
+            if plan:
+                left = _METER.plan_remaining_usd(name)
+                status = _METER.plan_status(name)
+                lines.append(
+                    f"{name} subscription: {plan}"
+                    + (f"; ≈{_fmt_usd(left)} of API-equivalent usage left"
+                       if left is not None else "")
+                    + (" -- LIMIT REACHED" if status.get("status") == "rejected"
+                       else ""))
+        if spec.allowance_tokens and spec.allowance_seconds:
+            left = spec.allowance_tokens - _allowance_used(spec)
+            lines.append(f"{name}: ≈{max(left, 0):,} of "
+                         f"{spec.allowance_tokens:,} tokens left this "
+                         f"{spec.allowance_window} (declared allowance)")
+        limit = _METER.ratelimit(name)
+        if limit.get("limit") and limit.get("remaining") is not None:
+            lines.append(f"{name}: rate limit {limit['remaining']:,} of "
+                         f"{limit['limit']:,} tokens/min left "
+                         f"(as of {_clock(float(limit.get('seen', 0)))})")
+        if spec.balance == "openrouter" and _advisor_ready(name)[0]:
+            credit = _fresh_credit(spec)
+            if credit.get("remaining") is not None:
+                lines.append(f"{name}: {_fmt_usd(credit['remaining'])} credit "
+                             "left" + (f" of {_fmt_usd(credit['limit'])}"
+                                       if credit.get("limit") else ""))
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Connecting another advisor
+# ---------------------------------------------------------------------------
+
+def _connect_advisor(name: str, provider: str, api_key: str = "",
+                     model: str = "", base_url: str = "",
+                     allowance_tokens: int = 0, allowance_window: str = "",
+                     notes: str = "", make_default: bool = False) -> str:
+    key = str(name or "").strip().lower()
+    if key == advisors.CLAUDE:
+        raise AdvisorInputError(
+            "`claude` is built in. Connect the Claude account with "
+            "advisor_login (subscription) or ANTHROPIC_API_KEY (API).")
+    if not advisors.NAME.match(key):
+        raise AdvisorInputError(
+            f"advisor names are 1-32 lowercase letters, digits, - or _; got "
+            f"{name!r}. Try e.g. 'chatgpt', 'gemini' or 'local'.")
+    provider = str(provider or "").strip().lower()
+    if provider not in advisors.PROVIDERS:
+        raise AdvisorInputError(
+            f"unknown provider {provider!r}; use one of "
+            f"{', '.join(advisors.PROVIDERS)}.")
+    entry = {"provider": provider}
+    for field_name, value in (("api_key", api_key), ("model", model),
+                              ("base_url", base_url), ("notes", notes),
+                              ("allowance_window", allowance_window)):
+        if str(value or "").strip():
+            entry[field_name] = str(value).strip()
+    if allowance_tokens:
+        entry["allowance_tokens"] = int(allowance_tokens)
+    problems: list = []
+    spec = advisors.build(key, entry, problems.append, "stored")
+    if spec is None or problems:
+        raise AdvisorInputError("; ".join(problems) or "invalid advisor")
+
+    model_id = advisors.model_for(spec, "")
+    token = _advisor_key(spec)
+    if spec.needs_key and not token:
+        raise AdvisorInputError(
+            f"provider {provider!r} needs an API key: pass api_key, or set "
+            f"{spec.api_key_env} in the MCP server env first.")
+    check = ""
+    try:
+        listing = openai_compat.get_json(spec.base_url + "/models", token,
+                                         timeout_s=15)
+        offered = [str(m.get("id")) for m in (listing.get("data") or [])
+                   if isinstance(m, dict)]
+        if offered and model_id not in offered:
+            check = (f"Note: the endpoint does not list the model {model_id!r}"
+                     f"; it offers: {', '.join(offered[:20])}"
+                     + (" ..." if len(offered) > 20 else "")
+                     + ". Pass model= to change it.")
+        else:
+            check = f"Verified: the endpoint answered and offers {model_id!r}."
+    except openai_compat.HTTPFailure as exc:
+        if exc.status in (401, 403):
+            raise AdvisorError(
+                f"{spec.base_url} rejected the API key (HTTP {exc.status}: "
+                f"{exc.message}). Nothing was saved. Check the key and call "
+                "advisor_connect again.") from None
+        check = (f"Could not list the endpoint's models (HTTP {exc.status}); "
+                 "saved anyway -- the first consult will show whether it "
+                 "works.")
+    except (openai_compat.Unreachable, openai_compat.Silent) as exc:
+        check = (f"Could not reach {spec.base_url} right now ({exc}); saved "
+                 "anyway. Start the server before consulting this advisor.")
+
+    path = _advisors_path()
+    store = advisors.read_store(path, _warn)
+    store.setdefault("advisors", {})[key] = entry
+    if make_default:
+        store["default"] = key
+        _OVERRIDES.pop("advisor", None)
+    advisors.write_store(path, store)
+    _load_advisors()
+    shadowed = _ADVISORS[key].source != "stored"
+    return (
+        f"Connected advisor {key!r} ({spec.label}): model {model_id}, endpoint "
+        f"{spec.base_url}, key "
+        + ("stored in an owner-only file" if api_key else
+           f"read from {spec.api_key_env}" if token else "none needed")
+        + f". {check}\n"
+        + (f"WARNING: an advisor named {key!r} is also defined in the "
+           "environment or config file, and that definition wins.\n"
+           if shadowed else "")
+        + f"Use it now with advisor={key!r} on ask_wisdomtooth, review_code "
+        "or compare_approaches, or together with others in multi_advisor. "
+        f"Default advisor: {_default_advisor()}.")
+
+
+def _disconnect_advisor(name: str) -> str:
+    key = str(name or "").strip().lower()
+    path = _advisors_path()
+    store = advisors.read_store(path, _warn)
+    stored = store.get("advisors") or {}
+    if key not in stored:
+        where = ("It is defined in ADVISOR_ADVISORS_JSON or the config file; "
+                 "remove it there." if key in _ADVISORS
+                 else f"Connected: {_advisor_choices()}.")
+        raise AdvisorInputError(f"no stored advisor named {name!r}. {where}")
+    del stored[key]
+    if store.get("default") == key:
+        store.pop("default")
+    if _OVERRIDES.get("advisor") == key:
+        _OVERRIDES.pop("advisor")
+    advisors.write_store(path, store)
+    _load_advisors()
+    return (f"Disconnected advisor {key!r} and deleted its stored settings and "
+            f"key. Default advisor: {_default_advisor()}.")
+
+
+# ---------------------------------------------------------------------------
+# Several advisors at once
+# ---------------------------------------------------------------------------
+
+_advisors_mod = advisors  # `advisors` is also multi_advisor's argument name
+
+
+def _split_target(item) -> tuple:
+    """"gpt" -> ("gpt", ""); "gpt:gpt-6-astra" -> ("gpt", "gpt-6-astra")."""
+    name, _, model = str(item or "").strip().partition(":")
+    return name.strip().lower(), model.strip()
+
+
+def _multi(question: str = "", context: str = "", attempts_so_far: str = "",
+           advisors: Optional[list] = None,
+           targeted_questions: Optional[dict] = None, model: str = "",
+           effort: str = "", max_tokens: int = 0,
+           context_files: Optional[list] = None,
+           confirm_over_limit: bool = False,
+           saved: Optional[dict] = None) -> str:
+    """Consult 2-3 advisors in parallel; return one combined result.
+
+    Everything that can be checked is checked before anything is sent: the
+    names, readiness, a question for each, and every account's balance. After
+    that one advisor failing costs only its own section.
+    """
+    limit = _advisors_mod.MAX_PER_CALL
+    targeted: dict = {}
+    for raw, text in (targeted_questions or {}).items():
+        name, choice = _split_target(raw)
+        if name in targeted:
+            raise AdvisorInputError(f"{name!r} has two targeted questions; "
+                                    "give each advisor one.")
+        targeted[name] = (choice, str(text or "").strip())
+    order: list = []
+    chosen: dict = {}
+    for item in advisors or []:
+        name, choice = _split_target(item)
+        if name in chosen:
+            raise AdvisorInputError(
+                f"{name!r} is listed twice; each advisor is asked once per "
+                "call.")
+        chosen[name] = choice
+        order.append(name)
+    for name, (choice, _text) in targeted.items():
+        if name not in chosen:
+            order.append(name)
+            chosen[name] = choice
+        elif choice and not chosen[name]:
+            chosen[name] = choice
+
+    if not order:
+        raise AdvisorInputError(
+            "name the advisors to ask: `advisors` (the same question to each) "
+            "and/or `targeted_questions` (advisor name -> its own question). "
+            f"Connected: {_advisor_choices()}.")
+    if len(order) > limit:
+        raise AdvisorInputError(
+            f"multi_advisor asks at most {limit} advisors per call; got "
+            f"{len(order)} ({', '.join(order)}). Pick the {limit} best suited.")
+    unknown = [n for n in order if n not in _ADVISORS]
+    if unknown:
+        raise AdvisorInputError(
+            f"not connected: {', '.join(unknown)}. Connected: "
+            f"{_advisor_choices()}. The user can add an advisor with "
+            "advisor_connect (e.g. provider gemini, openai or lmstudio).")
+    if len(order) < 2:
+        raise AdvisorInputError(
+            f"multi_advisor needs 2 or {limit} advisors. For one, use "
+            f"ask_wisdomtooth with advisor={order[0]!r}. Connected: "
+            f"{_advisor_choices()}.")
+    not_ready = [(n, _advisor_ready(n)[1]) for n in order
+                 if not _advisor_ready(n)[0]]
+    if not_ready:
+        raise AdvisorError(
+            "Nothing was sent. Not ready: "
+            + "; ".join(f"{n} -- {why}" for n, why in not_ready)
+            + ". Ask the ready ones, or have the user fix these first.")
+    questions = {n: (targeted[n][1] if n in targeted and targeted[n][1]
+                     else str(question or "").strip()) for n in order}
+    missing = [n for n in order if not questions[n]]
+    if missing:
+        raise AdvisorInputError(
+            f"no question for {', '.join(missing)}: pass `question` (shared) "
+            "or a targeted question for each advisor.")
+
+    parts = [context] if context else []
+    if attempts_so_far:
+        parts.append(f"<attempts_so_far>\n{attempts_so_far}\n</attempts_so_far>")
+    if context_files:
+        parts.append(_read_context_files(context_files))  # read once, for all
+    shared = "\n\n".join(parts)
+
+    asks = []
+    for name in order:
+        spec = _ADVISORS[name]
+        system, _q, user_content = _prepare(questions[name], shared)
+        use_model, use_effort, backend = _route(spec, chosen[name] or model,
+                                                effort)
+        asks.append(dict(spec=spec, model=use_model, effort=use_effort,
+                         backend=backend, max_tokens=max_tokens, system=system,
+                         user_content=user_content))
+    _hold_if_over(asks, confirm_over_limit, "multi_advisor")
+
+    parent = _CANCELLATION.get()
+    jobs = [(name, parent.child(name) if parent is not None else None,
+             contextvars.copy_context()) for name in order]
+
+    def run(job):
+        name, holder, context_copy = job
+
+        def inner():
+            if holder is not None:
+                _CANCELLATION.set(holder)
+            out: dict = {}
+            try:
+                answer = _consult(questions[name], context=shared,
+                                  model=chosen[name] or model, effort=effort,
+                                  max_tokens=max_tokens, kind="multi_advisor",
+                                  saved=out, advisor=name,
+                                  confirm_over_limit=confirm_over_limit,
+                                  held_already=True)
+                return name, True, answer, out.get("path")
+            except Exception as exc:  # one failure must not cost the others
+                return name, False, str(exc) or exc.__class__.__name__, None
+        return context_copy.run(inner)
+
+    with ThreadPoolExecutor(max_workers=len(jobs),
+                            thread_name_prefix="wisdomtooth-multi") as pool:
+        results = list(pool.map(run, jobs))
+
+    if not any(good for _n, good, _t, _p in results):
+        raise AdvisorError(
+            "Every advisor failed, so there is nothing to compare:\n"
+            + "\n".join(f"- {n}: {text}" for n, _g, text, _p in results))
+    if saved is not None:
+        saved["paths"] = [p for _n, _g, _t, p in results if p]
+
+    all_targeted = all(n in targeted and targeted[n][1] for n in order)
+    if all_targeted:
+        mode = "a targeted question to each"
+    elif targeted:
+        mode = ("targeted questions for "
+                + ", ".join(n for n in order if n in targeted)
+                + ", the shared question for the rest")
+    else:
+        mode = "the same question to each"
+    out = [f"MULTI-ADVISOR: {len(order)} advisors asked in parallel -- {mode}."]
+    for i, (name, good, text, _path) in enumerate(results, 1):
+        out.append(f"\n\n=== {i}. {name} ({_ADVISORS[name].label})"
+                   + ("" if good else " -- FAILED") + " ===")
+        if targeted:
+            asked = questions[name]
+            out.append("Question: " + (asked if len(asked) <= 300
+                                       else asked[:300] + " ..."))
+        out.append(text)
+    failed = sum(1 for _n, good, _t, _p in results if not good)
+    if targeted:
+        out.append("\n\n---\n[how to use this: each advisor answered its own "
+                   "targeted question -- combine the answers, each for its own "
+                   "part of the work; they are not votes on one question.]")
+    else:
+        out.append("\n\n---\n[how to use this: where the advisors agree, "
+                   "treat it as strong evidence; where they disagree, weigh "
+                   "each one's reasoning against what you know instead of "
+                   "taking a majority vote, and tell the user about any "
+                   "disagreement that affects the decision. Do not ask the "
+                   "same question again.]")
+    if failed:
+        out.append(f"\n[{failed} of {len(order)} advisors failed; their errors "
+                   "are above. Do not retry them in a loop.]")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
 # Runtime configuration and capability discovery
 # ---------------------------------------------------------------------------
 
-_CONFIGURABLE = ("model", "effort", "max_tokens", "answer_budget")
+_CONFIGURABLE = ("advisor", "model", "effort", "max_tokens", "answer_budget")
 
 
 def _configure(model: str = "", effort: str = "", max_tokens: int = 0,
-               answer_budget: int = -1, reset: bool = False) -> str:
+               answer_budget: int = -1, reset: bool = False,
+               advisor: str = "") -> str:
     """Apply runtime overrides and return the resulting effective settings."""
     if LOCKED:
         raise AdvisorError(
@@ -1523,7 +2372,18 @@ def _configure(model: str = "", effort: str = "", max_tokens: int = 0,
             "advisor config file) and restart the server entry.")
     if reset:
         _OVERRIDES.clear()
-    if model:
+    if advisor:
+        name = str(advisor).strip().lower()
+        if name not in _ADVISORS:
+            raise AdvisorInputError(
+                f"no advisor named {advisor!r}. Connected: "
+                f"{_advisor_choices()}. Add one with advisor_connect.")
+        _OVERRIDES["advisor"] = name
+    target = _default_advisor()
+    if model and target != advisors.CLAUDE:
+        # Another provider's model IDs follow its own naming.
+        _OVERRIDES.setdefault("advisor_models", {})[target] = str(model)
+    elif model:
         resolved = _tier_or_id(model)
         if not str(resolved).startswith("claude-"):
             raise AdvisorInputError(
@@ -1551,7 +2411,8 @@ def _configure(model: str = "", effort: str = "", max_tokens: int = 0,
         "Runtime overrides updated. These last until the server restarts and "
         "are still beaten by per-call model/effort/max_tokens arguments.\n"
         f"overrides: {changed}\n"
-        f"effective model: {_effective_model()}\n"
+        f"default advisor: {target}\n"
+        f"effective model: {_advisor_model(_ADVISORS[target])}\n"
         f"effective effort: {_effective_effort() or '(API default)'}\n"
         f"effective max tokens: {_effective_max_tokens()}\n"
         f"effective answer budget: "
@@ -1588,6 +2449,19 @@ def _model_catalogue() -> str:
                  "words — the target length of the advice, honoured on every "
                  "backend. Change it with advisor_configure(answer_budget=N).")
     lines.append(f"BACKEND: {_active_backend()} (configured: {BACKEND})")
+    others = [spec for name, spec in _ADVISORS.items()
+              if spec.kind != "claude"]
+    if others:
+        lines.append("")
+        lines.append("OTHER ADVISORS (pass advisor=<name>; the tiers above "
+                     "are Claude's, each advisor has its own):")
+        for spec in others:
+            tiers = ", ".join(f"{t} -> {m}" for t, m in sorted(spec.tiers.items()))
+            lines.append(f"  {spec.name} ({spec.label}): default "
+                         f"{_advisor_model(spec)}"
+                         + (f"; tiers {tiers}" if tiers else "")
+                         + "; effort " + ("/".join(spec.efforts)
+                                          if spec.efforts else "not sent"))
     if LOCKED:
         lines.append("NOTE: ADVISOR_LOCK=1 -- per-call model/effort/max_tokens "
                      "arguments are ignored.")
@@ -1596,7 +2470,10 @@ def _model_catalogue() -> str:
 
 async def _consult_with_heartbeat(ctx: Optional[Context], *args, **kwargs):
     """Run `_consult` off the event loop, reporting progress while it works."""
-    return await _with_heartbeat(ctx, _consult, *args, **kwargs)
+    name = str(kwargs.get("advisor") or "").strip().lower() or _default_advisor()
+    who = "Claude" if name == advisors.CLAUDE else name
+    return await _with_heartbeat(ctx, _consult, *args,
+                                 message=f"{who} is still working", **kwargs)
 
 
 async def _with_heartbeat(ctx: Optional[Context], fn, *args,
@@ -1653,7 +2530,8 @@ async def ask_wisdomtooth(question: str, context: str, attempts_so_far: str,
                           model: str = "", effort: str = "",
                           max_tokens: int = 0,
                           context_files: Optional[list[str]] = None,
-                          follow_up_of: str = "",
+                          follow_up_of: str = "", advisor: str = "",
+                          confirm_over_limit: bool = False,
                           ctx: Optional[Context] = None):
     """ESCALATION: Ask Wisdomtooth for expert advice when you are stuck.
 
@@ -1701,6 +2579,12 @@ async def ask_wisdomtooth(question: str, context: str, attempts_so_far: str,
         follow_up_of: To continue an earlier consult, the file name from its
             `[saved: ...]` line. The advisor then sees its earlier question and
             answer, so put only what is new in `context`.
+        advisor: Which connected advisor to ask -- "claude", or a name
+            advisor_status lists (e.g. "gemini", "chatgpt", "local"). Empty
+            asks the default advisor (Claude unless the user chose another).
+        confirm_over_limit: Leave false. Set true ONLY after the user agreed
+            to go ahead with a request the server HELD because it would cost
+            more than the account has left.
     """
     saved: dict = {}
     answer = await _consult_with_heartbeat(
@@ -1714,17 +2598,20 @@ async def ask_wisdomtooth(question: str, context: str, attempts_so_far: str,
         saved=saved,
         context_files=context_files,
         follow_up_of=follow_up_of,
+        advisor=advisor,
+        confirm_over_limit=confirm_over_limit,
     )
     return _result_blocks(answer, saved)
 
 
-@tool(title="Review code with Claude", annotations=CONSULT_ANNOTATIONS)
+@tool(title="Review code with an advisor", annotations=CONSULT_ANNOTATIONS)
 async def review_code(code: str, concern: str = "general quality",
                       model: str = "", effort: str = "",
                       max_tokens: int = 0,
                       context_files: Optional[list[str]] = None,
+                      advisor: str = "", confirm_over_limit: bool = False,
                       ctx: Optional[Context] = None):
-    """ESCALATION: Have Claude review code you are unsure about.
+    """ESCALATION: Have an advisor (Claude by default) review code you are unsure about.
 
     WHEN TO USE: after implementing something non-trivial where you have
     residual doubt — subtle concurrency/async logic, security-sensitive code,
@@ -1745,6 +2632,12 @@ async def review_code(code: str, concern: str = "general quality",
             default). Applies to the API backend only.
         context_files: Paths of related files (callers, interfaces, tests)
             for the server to read and attach, relative to the project folder.
+        advisor: Which connected advisor to ask -- "claude", or a name
+            advisor_status lists (e.g. "gemini", "chatgpt", "local"). Empty
+            asks the default advisor (Claude unless the user chose another).
+        confirm_over_limit: Leave false. Set true ONLY after the user agreed
+            to go ahead with a request the server HELD because it would cost
+            more than the account has left.
     """
     saved: dict = {}
     answer = await _consult_with_heartbeat(
@@ -1765,20 +2658,26 @@ async def review_code(code: str, concern: str = "general quality",
         scrub_context=False,
         kind="review_code",
         saved=saved,
+        advisor=advisor,
+        confirm_over_limit=confirm_over_limit,
     )
     return _result_blocks(answer, saved)
 
 
-@tool(title="Compare approaches with Claude", annotations=CONSULT_ANNOTATIONS)
+@tool(title="Compare approaches with an advisor",
+      annotations=CONSULT_ANNOTATIONS)
 async def compare_approaches(problem: str, options: str, criteria: str = "",
                              model: str = "", effort: str = "",
-                             max_tokens: int = 0, ctx: Optional[Context] = None):
-    """ESCALATION: Have Claude compare approaches when you can't decide.
+                             max_tokens: int = 0, advisor: str = "",
+                             confirm_over_limit: bool = False,
+                             ctx: Optional[Context] = None):
+    """ESCALATION: Have ONE advisor (Claude by default) weigh approaches you can't decide between.
 
     WHEN TO USE: you have identified 2+ viable approaches to a non-trivial
     problem (architecture, library choice, migration strategy) and the
     tradeoffs are genuinely unclear after your own analysis. Not for
-    decisions with an obvious answer.
+    decisions with an obvious answer. One advisor picks between options; to
+    put a question to several advisors, use multi_advisor.
 
     Args:
         problem: The problem being solved.
@@ -1792,6 +2691,12 @@ async def compare_approaches(problem: str, options: str, criteria: str = "",
             decisions with long-term consequences.
         max_tokens: Cap the answer length for this call (0 = configured
             default). Applies to the API backend only.
+        advisor: Which connected advisor to ask -- "claude", or a name
+            advisor_status lists (e.g. "gemini", "chatgpt", "local"). Empty
+            asks the default advisor (Claude unless the user chose another).
+        confirm_over_limit: Leave false. Set true ONLY after the user agreed
+            to go ahead with a request the server HELD because it would cost
+            more than the account has left.
     """
     question = (
         f"Problem: {problem}\n\nCandidate approaches:\n{options}\n"
@@ -1801,8 +2706,64 @@ async def compare_approaches(problem: str, options: str, criteria: str = "",
     saved: dict = {}
     answer = await _consult_with_heartbeat(ctx, question, model=model,
                                            effort=effort, max_tokens=max_tokens,
-                                           kind="compare_approaches", saved=saved)
+                                           kind="compare_approaches", saved=saved,
+                                           advisor=advisor,
+                                           confirm_over_limit=confirm_over_limit)
     return _result_blocks(answer, saved)
+
+
+@tool(title="Ask several advisors at once", annotations=CONSULT_ANNOTATIONS)
+async def multi_advisor(question: str = "", context: str = "",
+                        attempts_so_far: str = "",
+                        advisors: Optional[list[str]] = None,
+                        targeted_questions: Optional[dict[str, str]] = None,
+                        model: str = "", effort: str = "",
+                        context_files: Optional[list[str]] = None,
+                        confirm_over_limit: bool = False,
+                        ctx: Optional[Context] = None):
+    """ESCALATION: Consult 2 or 3 advisors in parallel, in one call (at most 3).
+
+    Only when the user has connected more than one advisor -- advisor_status
+    lists them (Claude, plus e.g. Gemini, ChatGPT or a local model). Two uses:
+
+    1. COMPARE: the same `question` to each advisor in `advisors`, for a
+       second (and third) opinion on a hard or high-stakes problem.
+    2. TARGET: a different question to each, in `targeted_questions`, to play
+       to each model's strengths -- e.g. {"claude": "<technical question>",
+       "gemini": "<UI/UX question>", "chatgpt": "<review this module>"}.
+    They combine: a targeted question overrides the shared one for that
+    advisor. Same escalation rules as ask_wisdomtooth; it costs one consult
+    per advisor, on each advisor's own account.
+
+    Args:
+        question: The shared question, for every advisor without a targeted
+            one.
+        context: Background every advisor sees -- code, errors, versions.
+        attempts_so_far: What you already tried and why it failed.
+        advisors: Names to ask the shared question, e.g. ["claude", "gemini"].
+            "name:model" picks a model for one advisor, e.g.
+            "chatgpt:gpt-6-astra".
+        targeted_questions: Advisor name -> its own question.
+        model: A tier ("fast", "balanced", "deep") applied to every advisor
+            in its own family. Use "name:model" for a specific model ID.
+        effort: Reasoning effort for every advisor, clamped to what each
+            accepts.
+        context_files: Files for the server to read once and attach for all.
+        confirm_over_limit: Leave false. Set true ONLY after the user agreed
+            to go ahead with a request the server HELD because an account
+            would go over what it has left.
+    """
+    saved: dict = {}
+    text = await _with_heartbeat(
+        ctx, _multi, question=question, context=context,
+        attempts_so_far=attempts_so_far, advisors=advisors,
+        targeted_questions=targeted_questions, model=model, effort=effort,
+        context_files=context_files, confirm_over_limit=confirm_over_limit,
+        saved=saved, message="The advisors are still working")
+    blocks = transcripts.result_blocks(text, None)
+    for path in saved.get("paths", []):
+        blocks += transcripts.result_blocks("", path)[1:]
+    return blocks
 
 
 CREDENTIAL_ANNOTATIONS = ToolAnnotations(
@@ -1878,6 +2839,61 @@ async def advisor_logout() -> str:
     return await asyncio.to_thread(_clear_oauth_token)
 
 
+@tool(title="Connect another advisor", annotations=CREDENTIAL_ANNOTATIONS)
+async def advisor_connect(name: str, provider: str, api_key: str = "",
+                          model: str = "", base_url: str = "",
+                          allowance_tokens: int = 0,
+                          allowance_window: str = "", notes: str = "",
+                          make_default: bool = False) -> str:
+    """Connect an advisor besides Claude: ChatGPT, Gemini, OpenRouter or a local model.
+
+    FREE -- makes no model call; it only lists the endpoint's models to check
+    the key and the address. Call it when the user asks to add an advisor.
+    The advisor is saved (its key in an owner-only file) and usable at once,
+    with no config edit or restart. Claude stays the default unless
+    make_default is true.
+
+    The key is a credential: do not repeat it back, log it, or put it
+    anywhere but this argument.
+
+    Args:
+        name: What to call it, e.g. "chatgpt", "gemini", "local".
+        provider: "openai" (ChatGPT), "gemini", "openrouter", "lmstudio",
+            "ollama", or "openai-compatible" (any other endpoint).
+        api_key: The provider's API key. Not needed for local servers, or
+            when the key is already in the env (OPENAI_API_KEY,
+            GEMINI_API_KEY, OPENROUTER_API_KEY).
+        model: A model ID (or tier) to use by default; each hosted provider
+            has a sensible default.
+        base_url: Only for a non-default endpoint (required for
+            "openai-compatible").
+        allowance_tokens: Optional token allowance the user wants tracked for
+            this account; a request that would exceed it is held for their
+            confirmation.
+        allowance_window: The allowance's window: "hour", "5h", "day",
+            "week" or "month".
+        notes: What this advisor is good at, shown in advisor_status.
+        make_default: Send plain consults to this advisor instead of Claude.
+    """
+    return await asyncio.to_thread(
+        _connect_advisor, name, provider, api_key=api_key, model=model,
+        base_url=base_url, allowance_tokens=allowance_tokens,
+        allowance_window=allowance_window, notes=notes,
+        make_default=make_default)
+
+
+@tool(title="Disconnect an advisor", annotations=CREDENTIAL_ANNOTATIONS)
+async def advisor_disconnect(name: str) -> str:
+    """Forget an advisor added with advisor_connect, and its stored key.
+
+    FREE -- makes no model call. Claude cannot be disconnected here.
+
+    Args:
+        name: The advisor's name, as advisor_status lists it.
+    """
+    return await asyncio.to_thread(_disconnect_advisor, name)
+
+
 @tool(title="List advisor models and effort levels",
       annotations=LOCAL_ANNOTATIONS)
 def advisor_models() -> str:
@@ -1895,7 +2911,8 @@ def advisor_models() -> str:
     readOnlyHint=False, destructiveHint=False, idempotentHint=True,
     openWorldHint=False))
 def advisor_configure(model: str = "", effort: str = "", max_tokens: int = 0,
-                      answer_budget: int = -1, reset: bool = False) -> str:
+                      answer_budget: int = -1, reset: bool = False,
+                      advisor: str = "") -> str:
     """Change the advisor's default model, effort, or token budget.
 
     FREE — makes no model call. Changes apply to every later consult in this
@@ -1918,19 +2935,24 @@ def advisor_configure(model: str = "", effort: str = "", max_tokens: int = 0,
             own context is tight; 0 removes the limit. -1 leaves it unchanged.
         reset: Drop all runtime overrides and return to the configuration the
             server started with.
+        advisor: Make this connected advisor the default for plain consults
+            (e.g. "gemini"; "claude" switches back). `model` then applies to
+            it.
     """
     return _configure(model=model, effort=effort, max_tokens=max_tokens,
-                      answer_budget=answer_budget, reset=reset)
+                      answer_budget=answer_budget, reset=reset,
+                      advisor=advisor)
 
 
 @tool(title="Advisor usage and spend", annotations=LOCAL_ANNOTATIONS)
 def advisor_usage(days: int = 7) -> str:
-    """Report the advisor's consults, tokens and estimated cost over time.
+    """Report consults, tokens and estimated cost over time, per advisor, and what each account has left.
 
-    FREE — makes no model call; reads the local usage ledger. Use when the
-    user asks how much the advisor has used, or before a burst of consults
-    when their plan's limits are tight. Cost is an estimate at API rates; the
-    subscription's own meter is not visible to this server.
+    FREE — makes no model call; reads the local usage ledger and the last
+    balance readings. Use when the user asks how much the advisors have used
+    or have left, or before a burst of consults when their limits are tight.
+    Cost is an estimate at API rates; the Claude plan's own meter appears
+    under BALANCES once a subscription consult has reported it.
 
     Args:
         days: How far back the per-model breakdown goes (1-35).
@@ -2028,12 +3050,40 @@ def _auth_report() -> str:
 
 @tool(title="Advisor status", annotations=LOCAL_ANNOTATIONS)
 def advisor_status() -> str:
-    """Report the advisor's active backend, billing target, and defaults.
+    """Report the connected advisors, what each account has left, the billing target and defaults.
 
     FREE — makes no model call. Use when the user asks which account the
-    advisor is using, or to sanity-check configuration.
+    advisor is using or how much is left, to see which advisors are ready
+    (and what each is good for) before using multi_advisor, or to
+    sanity-check configuration.
     """
     return _status_report()
+
+
+def _advisor_status_lines() -> list:
+    ready = []
+    lines = [f"advisors ({len(_ADVISORS)} connected; multi_advisor asks up to "
+             f"{advisors.MAX_PER_CALL} at once):"]
+    for name, spec in _ADVISORS.items():
+        ok, why = _advisor_ready(name)
+        if ok:
+            ready.append(name)
+        if spec.kind == "claude":
+            desc = f"Claude via the {_active_backend()} backend"
+        else:
+            desc = (f"{spec.label}, model {_advisor_model(spec)}, "
+                    f"{spec.base_url}, bills {spec.billing or 'its endpoint'}")
+        lines.append(f"  {name}: {desc} -- {'ready' if ok else 'NOT READY: ' + why}"
+                     + (f" -- {spec.notes}" if spec.notes else ""))
+    if len(ready) > 1:
+        lines.append(f"  tip: {len(ready)} advisors are ready -- multi_advisor "
+                     "can ask them the same question, or each its own.")
+    balances = _balance_lines()
+    lines.append("balances:" + ("" if balances else " none reported yet (the "
+                                "Claude plan meter appears after a "
+                                "subscription consult)"))
+    lines += ["  " + line for line in balances]
+    return lines
 
 
 def _status_report() -> str:
@@ -2060,6 +3110,8 @@ def _status_report() -> str:
         f"active backend: {backend}",
         f"billing: {billing}",
         f"backends: {_backends_line()}",
+        f"default advisor: {_default_advisor()}",
+        *_advisor_status_lines(),
         f"default model: {DEFAULT_MODEL}",
         f"default effort: {DEFAULT_EFFORT or '(API default)'}",
         f"max tokens: {_effective_max_tokens()}",
@@ -2070,7 +3122,9 @@ def _status_report() -> str:
             f"an answer over {budget * _TRIM_OVER:g} words returns its lead, "
             "with the rest in its transcript" if TRIM_ANSWERS and budget
             and SAVE_CONSULTS else "off"),
-        f"tool surface: {'minimal (ask_wisdomtooth, advisor_status)' if MINIMAL_TOOLS else 'full (11 tools)'}",
+        "tool surface: " + ("minimal (ask_wisdomtooth, advisor_status)"
+                            if MINIMAL_TOOLS
+                            else f"full ({len(_TOOL_NAMES)} tools)"),
         f"consult transcripts: {transcripts_line}",
         f"usage: {_usage_line()}",
         "usage ledger: " + (_usage_path() if USAGE_LOG

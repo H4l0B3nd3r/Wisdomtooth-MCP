@@ -1,5 +1,42 @@
 # AGENT-UPDATE.md — Migration playbook
 
+## 0.11.0 — other advisors, `multi_advisor`, account balances
+
+**Nothing to change**: Claude is still the only advisor, and the default,
+until the user connects another.
+
+- **Other advisors.** ChatGPT (`openai`), Gemini (`gemini`), OpenRouter,
+  LM Studio, Ollama, or any OpenAI-compatible endpoint, connected at runtime
+  with `advisor_connect` or configured under `advisors` in the config file or
+  `ADVISOR_ADVISORS_JSON`. `ask_wisdomtooth`, `review_code` and
+  `compare_approaches` take `advisor=<name>`; `advisor_configure(advisor=)` and
+  `default_advisor` change the default. The client uses only the standard
+  library (streamed server-sent events, with the idle limit, heartbeat notes
+  and cancellation the Claude path has), so there is no new dependency.
+- **`multi_advisor`**: 2 or 3 advisors in parallel, the same question to each
+  (`advisors`) or its own question to each (`targeted_questions`), or both.
+  `compare_approaches` stays the single-advisor tool for choosing between
+  options.
+- **Account monitoring.** `advisor_status` and `advisor_usage` list what each
+  account has left: the Claude plan's own 5-hour and 7-day utilization
+  (streamed by Claude Code), OpenRouter credit, `x-ratelimit-*` headers, and
+  any allowance the user declares. Answers carry a one-line summary.
+- **Held consults.** A request whose estimated cost exceeds what an account
+  has left is refused before anything is sent, with a `HELD` error. The agent
+  must ask the user, and may repeat the call with `confirm_over_limit=true`
+  only if they agree. A low balance that still covers the request only warns.
+- **Tools:** 14 now (`multi_advisor`, `advisor_connect`, `advisor_disconnect`
+  are new). `ADVISOR_MINIMAL_TOOLS=1` still advertises only `ask_wisdomtooth`
+  and `advisor_status`; `advisor=` works there too.
+- **New settings:** `ADVISOR_ADVISORS_JSON` / `advisors`,
+  `ADVISOR_DEFAULT_ADVISOR` / `default_advisor`, `ADVISOR_ADVISORS_FILE`,
+  `ADVISOR_ACCOUNTS_FILE`. New state files: `~/.wisdomtooth/advisors.json`
+  (owner-only; holds keys) and `~/.wisdomtooth/accounts.json`.
+- **Rules file:** `.kilocode/rules/wisdomtooth.md` has a new section on several
+  advisors and held consults. Copy it to wherever your client reads rules.
+
+---
+
 ## 0.10.0 — hangs caught in minutes, trimmed answers, HTTP auth, `doctor`
 
 **Nothing to change for a stdio config.** HTTP setups: see "HTTP auth".

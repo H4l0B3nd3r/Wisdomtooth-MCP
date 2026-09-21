@@ -30,3 +30,11 @@ class AdvisorInputError(AdvisorError, ValueError):
 
 class UsageLimitError(AdvisorError):
     """The subscription's headless quota is exhausted. Not retryable."""
+
+
+class OverLimitError(AdvisorError):
+    """A consult held because it would cost more than the account has left.
+
+    Nothing was sent. The message tells the agent to ask the user, and how to
+    send it anyway once they agree (`confirm_over_limit=true`).
+    """

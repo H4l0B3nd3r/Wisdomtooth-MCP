@@ -4,12 +4,13 @@ An MCP server that lets coding agents (Kilo Code, Cursor, Cline, Claude Code,
 custom agents) **escalate to a frontier model for advice when they are stuck**
 — one stateless call per question.
 
-**Claude is the model today, and stays the default.** The name is model-neutral
-on purpose — the backend layer is the seam where another provider (ChatGPT,
-Kimi, …) would slot in, and neither the tool surface nor the configuration
-assumes Anthropic. To be clear about what you get if you install it now:
-multi-provider support is *not implemented yet*, and every consult goes to
-Claude.
+**Claude is the default advisor, and stays the default.** Other advisors can
+be connected alongside it: ChatGPT (the OpenAI API), Gemini (the Google AI
+Studio API), OpenRouter, or a local model in LM Studio or Ollama — anything that
+speaks the OpenAI chat-completions protocol. The agent picks one per consult
+with `advisor=`, or asks two or three at once with `multi_advisor`: the same
+question, to compare the answers, or a targeted question to each, matched to
+each model's strengths. See [Other advisors](#other-advisors).
 
 By default it spends **your Claude subscription**, not API credits: consults go
 through the local Claude Code CLI, and the server only falls back to
@@ -36,16 +37,19 @@ troubleshooting. This file is the reference.
 
 | Tool | Purpose |
 |---|---|
-| `ask_wisdomtooth(question, context, attempts_so_far, [model, effort, max_tokens, context_files, follow_up_of])` | Stuck on implementation or framework/platform/OS behavior after docs + attempts failed. `context_files` has the server read files itself; `follow_up_of` continues a saved consult |
-| `review_code(code, concern, [model, effort, max_tokens, context_files])` | Residual doubt about subtle or security-sensitive code just written |
-| `compare_approaches(problem, options, criteria, [model, effort, max_tokens])` | 2+ viable approaches, tradeoffs unclear after your own analysis |
+| `ask_wisdomtooth(question, context, attempts_so_far, [model, effort, max_tokens, context_files, follow_up_of, advisor, confirm_over_limit])` | Stuck on implementation or framework/platform/OS behavior after docs + attempts failed. `context_files` has the server read files itself; `follow_up_of` continues a saved consult; `advisor` picks who answers |
+| `review_code(code, concern, [model, effort, max_tokens, context_files, advisor, confirm_over_limit])` | Residual doubt about subtle or security-sensitive code just written |
+| `compare_approaches(problem, options, criteria, [model, effort, max_tokens, advisor, confirm_over_limit])` | 2+ viable approaches, tradeoffs unclear after your own analysis. **One** advisor weighs the options |
+| `multi_advisor([question, context, attempts_so_far, advisors, targeted_questions, model, effort, context_files, confirm_over_limit])` | **2 or 3 advisors in parallel**: the same question to each (`advisors`), or its own question to each (`targeted_questions`) |
+| `advisor_connect(name, provider, [api_key, model, base_url, allowance_tokens, allowance_window, notes, make_default])` | Free. Connects ChatGPT, Gemini, OpenRouter or a local model, checks the key against the endpoint, and saves it — no restart |
+| `advisor_disconnect(name)` | Free. Forgets an advisor added with `advisor_connect`, and its key |
 | `advisor_login(force, wait_seconds)` | Free. **Connects the user's Claude subscription over OAuth** — opens the sign-in on their desktop, waits, and switches billing over with no restart |
 | `advisor_set_token(token)` | Free. Headless alternative: stores a `claude setup-token` credential privately and applies it immediately |
 | `advisor_logout()` | Free. Forgets the stored subscription token |
 | `advisor_models()` | Free. Lists tiers, per-model effort support, token ceiling |
-| `advisor_configure(model, effort, max_tokens, answer_budget, reset)` | Free. Changes defaults for this server process — no restart needed |
-| `advisor_status()` | Free. Active backend, billing target, current defaults, a one-line usage summary |
-| `advisor_usage(days)` | Free. Consults, tokens and API-rate cost for the last 1 h / 5 h / 24 h / 7 d and per model, plus caps |
+| `advisor_configure(model, effort, max_tokens, answer_budget, reset, advisor)` | Free. Changes defaults for this server process — no restart needed; `advisor` switches the default advisor |
+| `advisor_status()` | Free. Active backend, billing target, current defaults, every advisor and whether it is ready, what each account has left, a one-line usage summary |
+| `advisor_usage(days)` | Free. Consults, tokens and API-rate cost for the last 1 h / 5 h / 24 h / 7 d, per model and per advisor, account balances, plus caps |
 | `advisor_auth_check()` | Free. Login/credential diagnosis when a consult fails |
 
 ## Install
@@ -141,6 +145,91 @@ In `auto` mode only, a consult that fails because the plan's headless quota is
 exhausted retries on API credits (if a key exists) and says so loudly in the
 answer. Set `ADVISOR_FALLBACK_TO_API=0` to disable that.
 
+## Other advisors
+
+Claude is always there, as `claude`, and is the default. Any other advisor is
+a named entry with a **provider** preset, which fills in the endpoint, the key
+variable, the model tiers and what that provider accepts:
+
+| Provider | Endpoint | Key | Default tiers (`fast` / `balanced` / `deep`) |
+|---|---|---|---|
+| `openai` (ChatGPT) | `https://api.openai.com/v1` | `OPENAI_API_KEY` | `gpt-5.6-luna` / `gpt-5.6-terra` / `gpt-6-astra` |
+| `gemini` | `https://generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` | `gemini-3.5-flash-lite` / `gemini-3.8-flash` / `gemini-3.1-pro-preview` |
+| `openrouter` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` | none — set `model` |
+| `lmstudio` | `http://localhost:1234/v1` | none | none — set `model` |
+| `ollama` | `http://localhost:11434/v1` | none | none — set `model` |
+| `openai-compatible` | set `base_url` | optional | none — set `model` |
+
+The model IDs are the ones the providers documented in September 2026; they
+drift, so `model` and `tiers` override them per advisor.
+
+**Connecting one.** The user asks the agent, and the agent calls
+`advisor_connect`:
+
+```
+advisor_connect(name="gemini", provider="gemini", api_key="…")
+advisor_connect(name="local", provider="lmstudio", model="qwen/qwen3.8-27b",
+                base_url="http://localhost:8118/v1")
+```
+
+It lists the endpoint's models (free — no model call), refuses a key the
+endpoint rejects, warns about a model the endpoint does not offer, and saves
+the advisor to `~/.wisdomtooth/advisors.json` (owner-only, since it holds the
+key). The advisor works immediately, with no restart. `advisor_disconnect`
+removes it again.
+
+**Or configure them**, in the config file or `ADVISOR_ADVISORS_JSON`:
+
+```json
+{
+  "advisors": {
+    "chatgpt": {"provider": "openai"},
+    "gemini":  {"provider": "gemini", "notes": "strong on UI/UX and long context"},
+    "local":   {"provider": "ollama", "model": "qwen3:32b"},
+    "claude":  {"allowance_tokens": 2000000, "allowance_window": "week"}
+  },
+  "default_advisor": "claude"
+}
+```
+
+Per name, `ADVISOR_ADVISORS_JSON` beats the config file, which beats the
+store. Other fields: `api_key`, `api_key_env`, `base_url`, `model`, `tiers`,
+`efforts` (the reasoning-effort levels to send), `max_tokens_param`,
+`send_max_tokens`, `prices` (`[input, output]` USD per million tokens, for cost
+estimates), `allowance_tokens` / `allowance_window` (see below) and `notes`,
+which `advisor_status` shows so the agent knows what each one is for. The
+`claude` entry takes only the allowance and `notes`; Claude's billing is
+still `ADVISOR_BACKEND`'s.
+
+**Using them.** `advisor="gemini"` on `ask_wisdomtooth`, `review_code` or
+`compare_approaches` sends that consult to Gemini. `model` tiers map to each
+advisor's own models, and `effort` is sent as `reasoning_effort`, clamped to
+what the provider accepts (nothing is sent to a local model). Everything else
+is the same as for Claude: secret redaction, the answer budget, transcripts,
+the ledger, the repeat guard and the caps. `advisor_configure(advisor="gemini")`
+or `default_advisor` makes one the default.
+
+**`multi_advisor`** consults two or three advisors in parallel:
+
+```
+multi_advisor(question="Redis streams or SQS for this queue?",
+              context="…", attempts_so_far="…",
+              advisors=["claude", "chatgpt", "gemini"])
+
+multi_advisor(context="…", targeted_questions={
+    "claude":  "Is the lock-free queue in queue.rs correct?",
+    "gemini":  "Is the settings page layout clear?",
+    "chatgpt": "Review the whole storage module thoroughly."})
+```
+
+It checks every name, every advisor's readiness, a question for each and every
+account's balance before sending anything. After that, one advisor failing
+costs only its own section. `"chatgpt:gpt-6-astra"` picks a model for one
+advisor. The result has one section per advisor, a transcript link for each,
+and a note telling the agent how to weigh agreement and disagreement.
+`compare_approaches` is the single-advisor tool for choosing between options;
+`multi_advisor` is the one that asks several.
+
 ## Where the answer ends up
 
 Claude's answer comes back as an MCP tool result inside your agent's chat —
@@ -185,7 +274,7 @@ the same figures:
 Claude plans meter) and breaks the week down by model; `advisor_status` carries
 a one-line version. Subscription consults are not billed per token, so the
 dollar figure is a proxy for how much of the plan's allowance a consult used.
-The plan's own meter is not visible to an MCP server.
+The plan's own meter, which Claude Code now reports, is covered below.
 
 Optional caps stop an agent that escalates too often before it drains the plan:
 `ADVISOR_MAX_CONSULTS_PER_HOUR`, `_PER_5H`, `_PER_WEEK` and
@@ -193,6 +282,42 @@ Optional caps stop an agent that escalates too often before it drains the plan:
 sent, and the error says when the next slot opens. An identical consult inside
 `ADVISOR_REPEAT_WINDOW` minutes (default 30) returns the saved answer instead
 of paying twice.
+
+### Account balances, and consults held for the user
+
+`advisor_status` and `advisor_usage` list what each connected account has
+left, from whichever source is real for it:
+
+| Account | Source | Shown as |
+|---|---|---|
+| Claude subscription | Claude Code streams a `rate_limit_event` with the plan's own 5-hour and 7-day utilization | `5 h 7% used (resets 14:00), 7 d 18% used` |
+| OpenRouter | `GET /key` on the key | `$4.20 credit left of $10.00` |
+| OpenAI and most hosted APIs | `x-ratelimit-*` response headers | `29,000 of 30,000 tokens/min left` |
+| Any advisor | an allowance the user declares (`allowance_tokens` + `allowance_window` of `hour`, `5h`, `day`, `week` or `month`), measured by the ledger | `≈180,000 of 2,000,000 tokens left this week` |
+
+The plan meter is a share of the plan, not a token count. So the server also
+learns what a percentage point costs, by setting each consult's API-equivalent
+cost against how far it moved the meter. Anything else using the plan at the
+same time inflates that figure, which errs towards asking rather than
+overspending. OpenAI and Gemini expose no credit-balance API; declare an
+allowance to track them.
+
+Answers carry a short line with the same data, such as
+`[plan: 5 h 31% used · 7 d 44% used]` or
+`[balance: ≈8,460 of 100,000 tokens left this day (8% left) -- LOW; tell the user]`.
+
+**A consult is held for the user IF AND ONLY IF its estimated cost exceeds
+what the account has left.** Before sending, the server estimates the request
+(≈4 characters a token in, the answer budget plus thinking out) and checks it
+against the declared allowance, the plan meter (a full window, or one whose
+learned rate says the request will not fit) and an OpenRouter credit balance.
+If it would go over, nothing is sent. The agent gets a `HELD` error that names
+the account, the estimate and what is left, and tells it to ask the user; if
+they agree, the agent repeats the call with `confirm_over_limit=true`. A
+balance that is low but still covers the request is only a warning in the
+footer. The rate-limit headers never hold a consult, because they refill
+within a minute. `multi_advisor` checks every account first and holds the
+whole call, so nothing is half-spent.
 
 ## Files and follow-ups
 
@@ -265,6 +390,11 @@ Five layers, highest priority first:
 | `ADVISOR_HOST` / `ADVISOR_PORT` | `host` / `port` | `127.0.0.1` / `8484` | HTTP transport bind. Anything beyond loopback needs `ADVISOR_HTTP_TOKEN` |
 | `ADVISOR_HTTP_TOKEN` | `http_token` | — | Bearer token every HTTP request must carry (`Authorization: Bearer <token>`) |
 | `ADVISOR_HTTP_NO_AUTH` | `http_no_auth` | `0` | `1` allows a non-loopback bind without a token, when a proxy or firewall already guards the port |
+| `ADVISOR_ADVISORS_JSON` | `advisors` | — | Advisors besides Claude, as a JSON object of `name → {provider, …}` (see [Other advisors](#other-advisors)) |
+| `ADVISOR_DEFAULT_ADVISOR` | `default_advisor` | `claude` | Which advisor a consult without `advisor=` goes to |
+| `ADVISOR_ADVISORS_FILE` | `advisors_file` | `~/.wisdomtooth/advisors.json` | Where `advisor_connect` saves advisors and their keys (owner-only) |
+| `ADVISOR_ACCOUNTS_FILE` | `accounts_file` | `~/.wisdomtooth/accounts.json` | The last reading of each account's meter and balance |
+| `OPENAI_API_KEY` / `GEMINI_API_KEY` / `OPENROUTER_API_KEY` | — | — | Keys the `openai` / `gemini` / `openrouter` presets read, unless an advisor has its own `api_key` or `api_key_env` |
 | `ANTHROPIC_API_KEY` | — | — | Only for the API backend |
 | `CLAUDE_CODE_OAUTH_TOKEN` | — | — | Durable headless subscription auth. Usually unnecessary — `advisor_login` / `advisor_set_token` store this for you in `~/.wisdomtooth/credentials.json` |
 
@@ -343,14 +473,18 @@ model/effort tier, and received a usable in-budget answer.
 
 ## Adding a provider
 
-Launch ships Claude only, through the `claude-code` and `api` backends. Each is
-a `Backend` in `wisdomtooth/server.py`: a name for `ADVISOR_BACKEND`, the
-account it bills, a readiness check, and one
-`consult(system, user_content, model, effort, max_tokens) -> str` function. A
-ChatGPT or Kimi backend registers the same way with `register_backend(...)`,
-reports its tokens through `_note_usage(...)` so the ledger, caps and repeat
-guard cover it, and takes full model IDs (the `fast`/`balanced`/`deep` tiers
-name Claude models).
+Any provider with an OpenAI-compatible chat-completions endpoint needs no code:
+it is an `openai-compatible` advisor with a `base_url` and a `model`. A preset
+for a common one is an entry in `PROVIDERS` in `wisdomtooth/advisors.py`: its
+endpoint, key variable, tiers, the effort levels it accepts, which max-tokens
+parameter it expects, and whether it reports a balance.
+
+A provider that needs a different protocol, such as another CLI on the user's
+own plan, is a `Backend` in `wisdomtooth/server.py`: a name, the account it
+bills, a readiness check, and one
+`consult(system, user_content, model, effort, max_tokens) -> str` function,
+registered with `register_backend(...)`. It reports tokens through
+`_note_usage(...)`, so the ledger, caps and repeat guard cover it.
 
 ## Support the project
 

@@ -44,7 +44,8 @@ ADVISOR_ENV = tuple(sorted(set(_srv.CONFIG_KEYS.values()) | {
 # real CLI. ADVISOR_CONSULT_DIR is pinned to a temp directory by the autouse
 # `consult_dir` fixture below, and wiping it would scatter transcripts through
 # the developer's real ~/.wisdomtooth.
-_PRESERVED = {"ADVISOR_CLAUDE_BIN", "ADVISOR_CONSULT_DIR", "ADVISOR_USAGE_FILE"}
+_PRESERVED = {"ADVISOR_CLAUDE_BIN", "ADVISOR_CONSULT_DIR", "ADVISOR_USAGE_FILE",
+              "ADVISOR_ADVISORS_FILE", "ADVISOR_ACCOUNTS_FILE"}
 
 
 def _reload(env: dict) -> object:
@@ -75,6 +76,34 @@ def usage_file(tmp_path, monkeypatch):
     """Keep the usage ledger out of the developer's home, like transcripts."""
     path = tmp_path / "usage.jsonl"
     monkeypatch.setenv("ADVISOR_USAGE_FILE", str(path))
+    return path
+
+
+@pytest.fixture(autouse=True)
+def advisors_file(tmp_path, monkeypatch):
+    """Keep advisors connected by advisor_connect -- API keys included -- out
+    of the developer's real store."""
+    path = tmp_path / "advisors.json"
+    monkeypatch.setenv("ADVISOR_ADVISORS_FILE", str(path))
+    return path
+
+
+@pytest.fixture(autouse=True)
+def no_provider_keys(monkeypatch):
+    """Clear the provider key variables (OPENAI_API_KEY, GEMINI_API_KEY, ...)
+    the developer's shell may hold, so no test reads -- or spends -- a real
+    key. Derived from the presets, so a new provider is covered too."""
+    from wisdomtooth.advisors import PROVIDERS
+    for preset in PROVIDERS.values():
+        if preset.get("api_key_env"):
+            monkeypatch.delenv(preset["api_key_env"], raising=False)
+
+
+@pytest.fixture(autouse=True)
+def accounts_file(tmp_path, monkeypatch):
+    """Keep the account meter (plan utilization, balances) out of the home."""
+    path = tmp_path / "accounts.json"
+    monkeypatch.setenv("ADVISOR_ACCOUNTS_FILE", str(path))
     return path
 
 
@@ -284,6 +313,11 @@ else:
         event({"type": "message_stop"})
         emit({"type": "assistant", "message": {
             "role": "assistant", "content": [{"type": "text", "text": answer}]}})
+        # The plan's own meter, shaped like Claude Code 2.1.x's event.
+        if os.environ.get("FAKE_CLAUDE_RATE_LIMIT"):
+            emit({"type": "rate_limit_event",
+                  "rate_limit_info": json.loads(
+                      os.environ["FAKE_CLAUDE_RATE_LIMIT"])})
     finish({
         "type": "result", "subtype": "success", "is_error": False,
         "result": answer,
@@ -352,3 +386,22 @@ def no_claude(monkeypatch):
     """Make CLI discovery fail, so `auto` cannot pick the subscription path."""
     monkeypatch.setattr(shutil, "which", lambda name, *a, **k: None)
     monkeypatch.delenv("ADVISOR_CLAUDE_BIN", raising=False)
+
+
+# --------------------------------------------------------------------------
+# Fake OpenAI-compatible endpoint (see fake_openai.py)
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def fake_openai():
+    """A live OpenAI-compatible endpoint on 127.0.0.1; yields its state."""
+    sys.path.insert(0, str(Path(__file__).parent))
+    import fake_openai as _fake
+    state, stop = _fake.start()
+    yield state
+    stop()
+
+
+def advisors_json(**advisors) -> str:
+    """A value for ADVISOR_ADVISORS_JSON: advisors_json(gpt={...})."""
+    return json.dumps(advisors)

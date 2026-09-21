@@ -33,6 +33,12 @@ DO NOT USE for: questions you can answer yourself, simple syntax lookups,
 things Context7/docs would answer directly, or trivial decisions.
 ALWAYS include in `context`: what you tried, exact errors, and what the docs
 said -- the advisor is stateless and sees nothing else.
+SEVERAL ADVISORS: Claude is the default. If the user connected others,
+advisor_status lists them: pass advisor=<name> to ask one, or use
+multi_advisor to ask 2-3 at once -- the same question to compare answers, or
+a targeted question to each, matched to each model's strengths.
+A consult HELD because it would exceed an account's remaining allowance must
+go to the user for a decision; never set confirm_over_limit on your own.
 """
 
 

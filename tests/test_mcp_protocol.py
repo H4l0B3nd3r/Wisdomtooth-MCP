@@ -19,7 +19,8 @@ PKG_ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_TOOLS = {"ask_wisdomtooth", "review_code", "compare_approaches",
                   "advisor_status", "advisor_auth_check", "advisor_models",
                   "advisor_configure", "advisor_login", "advisor_set_token",
-                  "advisor_logout", "advisor_usage"}
+                  "advisor_logout", "advisor_usage", "multi_advisor",
+                  "advisor_connect", "advisor_disconnect"}
 
 
 def _params(**env):
@@ -327,3 +328,104 @@ async def test_minimal_mode_is_materially_smaller(fake_claude):
     async with advisor_session(fake_claude, ADVISOR_MINIMAL_TOOLS="1") as s:
         minimal = size((await s.list_tools()).tools)
     assert minimal < full / 2
+
+
+# --------------------------------------------------------------------------
+# Several advisors over the wire
+# --------------------------------------------------------------------------
+
+import json as _json  # noqa: E402
+
+
+def _advisors(fake_openai):
+    return _json.dumps({
+        "gpt": {"provider": "openai-compatible",
+                "base_url": fake_openai.base_url, "model": "gpt-fake"},
+        "gem": {"provider": "openai-compatible",
+                "base_url": fake_openai.base_url, "model": "gem-fake"}})
+
+
+async def test_multi_advisor_is_declared_for_both_uses(fake_claude):
+    async with advisor_session(fake_claude) as session:
+        tools = {t.name: t for t in (await session.list_tools()).tools}
+        schema = field(tools["multi_advisor"], "inputSchema", "input_schema")
+        props = schema["properties"]
+        assert {"question", "context", "advisors", "targeted_questions",
+                "confirm_over_limit"} <= set(props)
+        assert "3" in tools["multi_advisor"].description
+        ann = tools["multi_advisor"].annotations
+        assert field(ann, "openWorldHint", "open_world_hint") is True
+
+
+async def test_ask_wisdomtooth_takes_an_advisor_over_the_wire(fake_claude,
+                                                             fake_openai):
+    async with advisor_session(fake_claude,
+                               ADVISOR_ADVISORS_JSON=_advisors(fake_openai)) as s:
+        result, text = await _call(s, "ask_wisdomtooth", {
+            "question": "q", "context": "c", "attempts_so_far": "a",
+            "advisor": "gem"})
+        assert field(result, "isError", "is_error") is not True
+        assert "FAKE OPENAI ANSWER" in text
+        assert fake_openai.last["body"]["model"] == "gem-fake"
+
+
+async def test_multi_advisor_end_to_end_same_question(fake_claude,
+                                                       fake_openai):
+    async with advisor_session(fake_claude,
+                               ADVISOR_ADVISORS_JSON=_advisors(fake_openai)) as s:
+        result = await s.call_tool("multi_advisor", {
+            "question": "which queue?", "context": "c",
+            "attempts_so_far": "a", "advisors": ["claude", "gpt", "gem"]})
+        assert field(result, "isError", "is_error") is not True
+        text = "\n".join(b.text for b in result.content
+                         if isinstance(b, types.TextContent))
+        links = [b for b in result.content if getattr(b, "type", "") ==
+                 "resource_link"]
+        assert "FAKE ANSWER" in text and text.count("FAKE OPENAI ANSWER") == 2
+        assert len(links) == 3
+        assert "which queue?" in fake_claude.last["prompt"]
+
+
+async def test_multi_advisor_end_to_end_targeted(fake_claude, fake_openai):
+    async with advisor_session(fake_claude,
+                               ADVISOR_ADVISORS_JSON=_advisors(fake_openai)) as s:
+        _, text = await _call(s, "multi_advisor", {
+            "context": "c", "targeted_questions": {
+                "claude": "TECH?", "gem": "UIUX?", "gpt": "REVIEW?"}})
+        assert "TECH?" in fake_claude.last["prompt"]
+        by_model = {c["body"]["model"]: c["body"]["messages"][1]["content"]
+                    for c in fake_openai.chats()}
+        assert "UIUX?" in by_model["gem-fake"]
+        assert "REVIEW?" in by_model["gpt-fake"]
+        assert "targeted" in text.lower()
+
+
+async def test_a_held_consult_reaches_the_agent_with_its_instructions(
+        fake_claude, fake_openai):
+    advisors = _json.dumps({"claude": {"allowance_tokens": 10,
+                                       "allowance_window": "day"}})
+    async with advisor_session(fake_claude,
+                               ADVISOR_ADVISORS_JSON=advisors) as s:
+        result, text = await _call(s, "ask_wisdomtooth", {
+            "question": "q", "context": "c", "attempts_so_far": "a"})
+        assert field(result, "isError", "is_error") is True
+        assert "confirm_over_limit" in text
+        result, text = await _call(s, "ask_wisdomtooth", {
+            "question": "q", "context": "c", "attempts_so_far": "a",
+            "confirm_over_limit": True})
+        assert field(result, "isError", "is_error") is not True
+        assert "FAKE ANSWER" in text
+
+
+async def test_advisor_connect_over_the_wire(fake_claude, fake_openai):
+    async with advisor_session(fake_claude) as s:
+        _, text = await _call(s, "advisor_connect", {
+            "name": "local", "provider": "openai-compatible",
+            "base_url": fake_openai.base_url, "model": "fake-model-a"})
+        assert "connected" in text.lower()
+        _, text = await _call(s, "ask_wisdomtooth", {
+            "question": "q", "context": "c", "attempts_so_far": "a",
+            "advisor": "local"})
+        assert "FAKE OPENAI ANSWER" in text
+        _, status = await _call(s, "advisor_status", {})
+        assert "local" in status

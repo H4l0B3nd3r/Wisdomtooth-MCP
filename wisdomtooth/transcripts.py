@@ -126,7 +126,7 @@ def result_blocks(answer: str, path: Optional[str]) -> list:
             type="resource_link",
             uri=pathlib.Path(path).as_uri(),
             name=os.path.basename(path),
-            description="Claude's full answer, saved so the user can read it "
+            description="The advisor's full answer, saved so the user can read it "
                         "outside the chat",
             mimeType="text/markdown",
             annotations=Annotations(audience=["user"], priority=0.9),

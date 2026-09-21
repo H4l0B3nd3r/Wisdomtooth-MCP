@@ -245,7 +245,7 @@ def status_line(records: list, now: float) -> str:
 
 
 def report(records: list, now: float, days: int, where: str, caps_text: str,
-           repeat_text: str) -> str:
+           repeat_text: str, sections: Optional[list] = None) -> str:
     """The advisor_usage table."""
     lines = [f"USAGE LEDGER: {where}", "",
              f"{'window':<8}{'consults':>9}{'repeats':>9}{'errors':>8}"
@@ -270,6 +270,8 @@ def report(records: list, now: float, days: int, where: str, caps_text: str,
                      f"{fmt_tokens(s['input'])} in / {fmt_tokens(s['output'])} out"
                      + (f"  ≈{fmt_usd(s['cost'])}" if s["cost"] is not None
                         else ""))
+    if sections:
+        lines += [""] + list(sections)
     lines += [
         "",
         "CAPS: " + caps_text,
@@ -278,5 +280,5 @@ def report(records: list, now: float, days: int, where: str, caps_text: str,
         "Cost is what these tokens would cost at API rates. Subscription "
         "consults are not billed per token, but this is a fair proxy for how "
         "much of the plan's 5-hour and weekly allowance they use. The plan's "
-        "own meter is not visible to this server."]
+        "own meter, when Claude Code reports it, is under BALANCES."]
     return "\n".join(lines)

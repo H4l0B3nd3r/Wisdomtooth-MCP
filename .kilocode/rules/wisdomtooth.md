@@ -64,6 +64,35 @@ user rather than looping.
 - A "Consult cap reached" error means the user limited how often you may
   escalate. Tell them; do not retry.
 
+## Several advisors
+
+Claude is the default advisor. The user may have connected others (ChatGPT,
+Gemini, a local model...); `advisor_status` lists them, what each is good for
+(`notes`), and whether each is ready.
+
+- To ask one of them, pass `advisor=<name>` to `ask_wisdomtooth`,
+  `review_code` or `compare_approaches`.
+- `multi_advisor` asks 2 or 3 in parallel, **at most 3**. Use `advisors` for
+  the same question to each, when a second opinion is worth its cost (a
+  high-stakes or stubborn problem). Use `targeted_questions` to split a
+  problem by strengths, e.g. `{"claude": "<concurrency question>",
+  "gemini": "<UI/UX question>", "chatgpt": "<review this module>"}`.
+  Every advisor costs its own consult, so the escalation rules above apply to
+  each one.
+- When compared answers disagree, weigh the reasoning; don't count votes. Tell
+  the user about disagreements that affect the decision.
+- If the user asks to add an advisor, call `advisor_connect`. Never repeat an
+  API key back.
+
+### Held consults and low balances
+
+A `HELD` error means the request would cost more than the account has left.
+Nothing was sent. **Ask the user** whether to go ahead, and quote what the
+error says is left. Only if they agree, repeat the same call with
+`confirm_over_limit=true`. Never set it on your own. A footer ending in
+`LOW; tell the user` means the request went through but the account is
+nearly spent: mention it.
+
 ## Choosing model, effort, and length
 
 Call `advisor_models` (free, no model call) if you are unsure what is available.

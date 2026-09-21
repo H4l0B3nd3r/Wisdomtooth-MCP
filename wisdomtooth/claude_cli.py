@@ -53,7 +53,10 @@ class Cancellation:
     def __init__(self):
         self.cancelled = False
         self.proc = None
-        self.stream: Optional["StreamState"] = None
+        # A CLI's StreamState, or an HTTP backend's -- which can also `close`.
+        self.stream = None
+        # Per-advisor holders of a multi_advisor call, cancelled with this one.
+        self.children: dict = {}
         self._lock = threading.Lock()
 
     def attach(self, proc) -> bool:
@@ -66,11 +69,29 @@ class Cancellation:
         with self._lock:
             self.cancelled = True
             proc = self.proc
+            stream = self.stream
+            children = list(self.children.values())
         if proc is not None and proc.poll() is None:
             kill_tree(proc)
+        close = getattr(stream, "close", None)
+        if close is not None:
+            close()  # an HTTP stream: unblocks the read in progress
+        for child in children:
+            child.cancel()
+
+    def child(self, name: str) -> "Cancellation":
+        """A holder for one of several consults running under this one."""
+        holder = Cancellation()
+        with self._lock:
+            holder.cancelled = self.cancelled
+            self.children[name] = holder
+        return holder
 
     @property
     def note(self) -> str:
+        if self.children:
+            return "; ".join(f"{name}: {child.note}" for name, child
+                             in list(self.children.items()) if child.note)
         return self.stream.note if self.stream is not None else ""
 
 
@@ -155,6 +176,9 @@ class StreamState:
         self.raw: list = []
         self.phase = ""
         self.chars = 0
+        # The plan's own meter: Claude Code 2.1.x streams a `rate_limit_event`
+        # with the 5-hour and 7-day utilization of the subscription.
+        self.rate_limit: Optional[dict] = None
 
     def feed(self, line: str) -> None:
         line = line.strip()
@@ -170,6 +194,10 @@ class StreamState:
         kind = obj.get("type")
         if kind == "result":
             self.result = obj
+        elif kind == "rate_limit_event":
+            info = obj.get("rate_limit_info")
+            if isinstance(info, dict):
+                self.rate_limit = info
         elif kind == "stream_event":
             event = obj.get("event") or {}
             if event.get("type") == "content_block_start":
@@ -192,7 +220,10 @@ class StreamState:
 
     def stdout(self) -> str:
         if self.result is not None:
-            return json.dumps(self.result)
+            result = self.result
+            if self.rate_limit is not None:
+                result = dict(result, rate_limit_info=self.rate_limit)
+            return json.dumps(result)
         return "\n".join(self.raw)
 
 
