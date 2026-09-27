@@ -12,10 +12,10 @@ with `advisor=`, or asks two or three at once with `multi_advisor`: the same
 question, to compare the answers, or a targeted question to each, matched to
 each model's strengths. See [Other advisors](#other-advisors).
 
-By default it spends **your Claude subscription**, not API credits: consults go
-through the local Claude Code CLI, and the server only falls back to
-pay-per-token API credits if the subscription is not usable. Every answer is
-footed with which account paid for it.
+Claude consults use an **Anthropic API key** (`ANTHROPIC_API_KEY`, billed per
+token). It also **works with your own Claude Code install**: without a key, it
+runs the `claude` CLI you have signed in to. Every answer is footed with which
+account paid for it.
 
 It is deliberately positioned as an escalation path: the agent should use it
 when it is having difficulty implementing code or understanding a framework,
@@ -43,9 +43,6 @@ troubleshooting. This file is the reference.
 | `multi_advisor([question, context, attempts_so_far, advisors, targeted_questions, model, effort, context_files, confirm_over_limit])` | **2 or 3 advisors in parallel**: the same question to each (`advisors`), or its own question to each (`targeted_questions`) |
 | `advisor_connect(name, provider, [api_key, model, base_url, allowance_tokens, allowance_window, notes, make_default])` | Free. Connects ChatGPT, Gemini, OpenRouter, a local model, or a CLI you installed (Codex, Antigravity, Kilo, Copilot...), checks what it can, and saves it — no restart |
 | `advisor_disconnect(name)` | Free. Forgets an advisor added with `advisor_connect`, and its key |
-| `advisor_login(force, wait_seconds)` | Free. **Connects the user's Claude subscription over OAuth** — opens the sign-in on their desktop, waits, and switches billing over with no restart |
-| `advisor_set_token(token)` | Free. Headless alternative: stores a `claude setup-token` credential privately and applies it immediately |
-| `advisor_logout()` | Free. Forgets the stored subscription token |
 | `advisor_models()` | Free. Lists tiers, per-model effort support, token ceiling |
 | `advisor_configure(model, effort, max_tokens, answer_budget, reset, advisor)` | Free. Changes defaults for this server process — no restart needed; `advisor` switches the default advisor |
 | `advisor_status()` | Free. Active backend, billing target, current defaults, every advisor and whether it is ready, what each account has left, a one-line usage summary |
@@ -55,58 +52,45 @@ troubleshooting. This file is the reference.
 ## Install
 
 ```bash
-uv tool install git+https://github.com/H4l0B3nd3r/Wisdomtooth-MCP   # recommended
-# or: pipx install git+https://github.com/H4l0B3nd3r/Wisdomtooth-MCP
+uv tool install wisdomtooth-mcp          # recommended
+# or: pipx install wisdomtooth-mcp
 ```
 
-This puts a `wisdomtooth-mcp` command on your PATH (stdio MCP server).
-Python 3.10 or newer is required; `uv` provides one if you have none.
+This puts a `wisdomtooth-mcp` command on your PATH (a stdio MCP server).
+Python 3.10 or newer is required; `uv` provides one if you have none. Docker
+users can skip this: see [Docker](#docker).
 
-**For subscription billing** (the default), install
-[Claude Code](https://claude.com/claude-code), then connect your account. The easy way is to **ask your agent to call the
-`advisor_login` tool** — it opens the official Claude sign-in in a console
-window, waits for you to finish in the browser, and switches the advisor onto
-subscription billing straight away. No config file to edit, no server to
-restart.
+Then give it a way to reach Claude, one of:
 
-The equivalents, if you would rather do it by hand:
+- **An Anthropic API key** (the default path). Create one at
+  [console.anthropic.com](https://console.anthropic.com) and put it in the
+  server's environment as `ANTHROPIC_API_KEY`. Consults are billed per token.
+- **Your own Claude Code install.** If [Claude Code](https://claude.com/claude-code)
+  is installed and you have signed in to it (run `claude` once), Wisdomtooth
+  uses it when no API key is set. It runs your install exactly as you signed
+  it in; Wisdomtooth never signs in to anything itself.
 
-```bash
-claude auth login --claudeai     # interactive; then re-run advisor_login to confirm
-claude auth status               # should print "authMethod": "claude.ai"
-```
-
-On a headless box, in a container, or when your editor launches the MCP server
-with a reduced environment, use the durable token instead:
-
-```bash
-claude setup-token               # prints a long-lived subscription token
-```
-
-…then have your agent pass that token to `advisor_set_token`. The advisor
-stores it in `~/.wisdomtooth/credentials.json` (owner-only) and injects it
-into every consult, so it survives restarts and reduced GUI environments
-without ever appearing in your MCP client's config.
+`wisdomtooth-mcp doctor` checks what it can find and prints a ready-to-paste
+client config.
 
 ## Add to a client
 
 **Claude Code**
 
 ```bash
-claude mcp add wisdomtooth -- wisdomtooth-mcp
+claude mcp add wisdomtooth --env ANTHROPIC_API_KEY=sk-ant-... -- wisdomtooth-mcp
 ```
 
-**Kilo Code (current)** — merge `kilo-configs/kilo.subscription.jsonc` into your
-project's `kilo.jsonc` under the `mcp` key, or use Settings → MCP → Add Server →
-Local (stdio), command `wisdomtooth-mcp`.
+**Kilo Code** — merge `kilo-configs/kilo.jsonc` into your project's
+`kilo.jsonc` under the `mcp` key (`kilo.claude-code.jsonc` if you use your
+Claude Code install instead of a key).
 
-**Kilo Code (classic)** — copy `kilo-configs/mcp.json` to `.kilocode/mcp.json`.
-
-**Cursor / Windsurf / Claude Desktop** — standard `mcpServers` JSON with command
-`wisdomtooth-mcp`; same shape as `kilo-configs/mcp.json`.
+**Cursor / Windsurf / Cline / Claude Desktop** — standard `mcpServers` JSON with
+command `wisdomtooth-mcp`; see `kilo-configs/mcp.json`, or run
+`wisdomtooth-mcp doctor --client cursor`.
 
 **Escalation policy** — copy `.kilocode/rules/wisdomtooth.md` into your
-project's `.kilocode/rules/`. Kilo loads these as standing instructions, so the
+project's `.kilocode/rules/` (or wherever your client reads rules), so the
 agent knows to try Context7 and its own fixes first.
 
 Tip: leave `ask_wisdomtooth` **off** any auto-approve/`alwaysAllow` list at
@@ -119,27 +103,37 @@ the policy; auto-approve later if it behaves.
 
 | Value | Behaviour |
 |---|---|
-| `auto` (default) | Claude Code CLI if it is installed **and logged in** → your **subscription**. Otherwise `ANTHROPIC_API_KEY` → your **Console account**. If neither exists, every consult fails with instructions rather than guessing. |
-| `claude-code` | Always the CLI. Never spends API credits, even if the plan's quota is exhausted. |
-| `api` | Always the Anthropic API. Pay-per-token on the Console account, **not** the Pro/Max subscription. |
+| `auto` (default) | `ANTHROPIC_API_KEY` (or an Anthropic SDK profile) → the **Anthropic API**, per token. Without one, your own **Claude Code install**, if it is signed in. If neither exists, every consult fails with instructions rather than guessing. |
+| `api` | Always the Anthropic API. |
+| `claude-code` | Always your Claude Code install. `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` are removed from its environment, so it uses the install's own sign-in. |
 
-If `advisor_status` says the backend is `api` or `unavailable` and you have a
-Pro/Max plan, call `advisor_login` — that is the whole point of it.
+The server never moves you from one to the other on its own: if Claude Code
+reports that its usage limit is reached, the consult fails and says so.
 
-`ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` are stripped from the CLI
-subprocess, because Claude Code prioritizes them over the subscription and would
-silently bill the API account instead. The subscription token is injected in
-their place, from `CLAUDE_CODE_OAUTH_TOKEN` if set, otherwise from the
-advisor's own credential store.
+## Docker
 
-Note that `loggedIn: true` is not sufficient on its own: a CLI signed in with
-an API key still bills the Console account. `advisor_auth_check` reports the
-`authMethod` and flags anything that is not `claude.ai`; `advisor_login` with
-`force=true` switches it.
+The image runs the API backend (a container has no Claude Code sign-in):
 
-In `auto` mode only, a consult that fails because the plan's headless quota is
-exhausted retries on API credits (if a key exists) and says so loudly in the
-answer. Set `ADVISOR_FALLBACK_TO_API=0` to disable that.
+```bash
+docker run -i --rm -e ANTHROPIC_API_KEY ghcr.io/h4l0b3nd3r/wisdomtooth-mcp
+```
+
+That is a stdio server, so an MCP client can launch it directly; see
+`kilo-configs/kilo.docker.jsonc`. For one long-running server shared by
+several clients, use the HTTP transport, which requires a bearer token once it
+listens beyond localhost:
+
+```bash
+docker run -d --name wisdomtooth -p 127.0.0.1:8484:8484 \
+  -e ANTHROPIC_API_KEY -e ADVISOR_TRANSPORT=http -e ADVISOR_HOST=0.0.0.0 \
+  -e ADVISOR_HTTP_TOKEN=<a long random string> \
+  -v wisdomtooth-state:/home/wisdomtooth/.wisdomtooth \
+  ghcr.io/h4l0b3nd3r/wisdomtooth-mcp
+```
+
+The volume keeps transcripts and the usage ledger across restarts. Advisors
+reached over HTTP (ChatGPT, Gemini, OpenRouter) work in the container; CLI
+advisors and `context_files` need the host.
 
 ## Other advisors
 
@@ -299,7 +293,7 @@ the same figures:
 
 `advisor_usage` totals the last hour, 5 hours, 24 hours and 7 days (the windows
 Claude plans meter) and breaks the week down by model; `advisor_status` carries
-a one-line version. Subscription consults are not billed per token, so the
+a one-line version. Claude Code consults are not billed per token, so the
 dollar figure is a proxy for how much of the plan's allowance a consult used.
 The plan's own meter, which Claude Code now reports, is covered below.
 
@@ -317,7 +311,7 @@ left, from whichever source is real for it:
 
 | Account | Source | Shown as |
 |---|---|---|
-| Claude subscription | Claude Code streams a `rate_limit_event` with the plan's own 5-hour and 7-day utilization | `5 h 7% used (resets 14:00), 7 d 18% used` |
+| Claude Code | Claude Code streams a `rate_limit_event` with the plan's own 5-hour and 7-day utilization | `5 h 7% used (resets 14:00), 7 d 18% used` |
 | OpenRouter | `GET /key` on the key | `$4.20 credit left of $10.00` |
 | OpenAI and most hosted APIs | `x-ratelimit-*` response headers | `29,000 of 30,000 tokens/min left` |
 | Any advisor | an allowance the user declares (`allowance_tokens` + `allowance_window` of `hour`, `5h`, `day`, `week` or `month`), measured by the ledger | `≈180,000 of 2,000,000 tokens left this week` |
@@ -384,7 +378,7 @@ Five layers, highest priority first:
 | `ADVISOR_BACKEND` | `backend` | `auto` | `auto` / `claude-code` / `api`, or a registered provider |
 | `ADVISOR_MODEL` | `model` | `balanced` | Tier alias or full model ID |
 | `ADVISOR_EFFORT` | `effort` | (API default) | `low`/`medium`/`high`/`xhigh`/`max` |
-| `ADVISOR_ANSWER_BUDGET` | `answer_budget` | preset (`2000`) | Ceiling on answer length in words, presented to Claude as a ceiling, not a target. Works on **both** backends; `0` disables. The only length control the subscription backend has |
+| `ADVISOR_ANSWER_BUDGET` | `answer_budget` | preset (`2000`) | Ceiling on answer length in words, presented to Claude as a ceiling, not a target. Works on **both** backends; `0` disables. The only length control the Claude Code backend has |
 | `ADVISOR_TRIM_ANSWERS` | `trim_answers` | `1` | When an answer runs past 1.5× the budget, the caller gets its lead and a pointer to the saved transcript, which keeps the whole answer. Needs saved consults; `0` disables |
 | `ADVISOR_MINIMAL_TOOLS` | `minimal_tools` | preset (`0`) | `1` advertises only `ask_wisdomtooth` + `advisor_status`, cutting per-turn tool context from ~6,200 to ~1,300 tokens |
 | `ADVISOR_MAX_TOKENS` | `max_tokens` | `64000` | Answer cap, **API backend only** (the CLI has no such flag), max 128000 |
@@ -409,7 +403,6 @@ Five layers, highest priority first:
 | `ADVISOR_SYSTEM_PROMPT_FILE` | `system_prompt_file` | — | Same, from a file |
 | `ADVISOR_SYSTEM_PROMPT_EXTRA` | `system_prompt_extra` | — | Append house rules to the built-in persona |
 | `ADVISOR_MAX_BUDGET_USD` | `max_budget_usd` | — | Hard spend cap per consult (CLI backend) |
-| `ADVISOR_FALLBACK_TO_API` | `fallback_to_api` | `1` | Allow the quota-exhausted fallback in `auto` |
 | `ADVISOR_MAX_CONTEXT_CHARS` | `max_context_chars` | `60000` | Truncation cap for `context` |
 | `ADVISOR_NSFW_SCRUB` | `nsfw_scrub` | `0` | `1` replaces profanity in outbound text with mild substitutes |
 | `ADVISOR_CLAUDE_BIN` | `claude_bin` | (PATH) | Absolute path to `claude` |
@@ -423,7 +416,7 @@ Five layers, highest priority first:
 | `ADVISOR_ACCOUNTS_FILE` | `accounts_file` | `~/.wisdomtooth/accounts.json` | The last reading of each account's meter and balance |
 | `OPENAI_API_KEY` / `GEMINI_API_KEY` / `OPENROUTER_API_KEY` | — | — | Keys the `openai` / `gemini` / `openrouter` presets read, unless an advisor has its own `api_key` or `api_key_env` |
 | `ANTHROPIC_API_KEY` | — | — | Only for the API backend |
-| `CLAUDE_CODE_OAUTH_TOKEN` | — | — | Durable headless subscription auth. Usually unnecessary — `advisor_login` / `advisor_set_token` store this for you in `~/.wisdomtooth/credentials.json` |
+| `CLAUDE_CODE_OAUTH_TOKEN` | — | — | Claude Code's own headless sign-in, if you use one; passed through to it unchanged |
 
 Example `~/.wisdomtooth/config.json`:
 

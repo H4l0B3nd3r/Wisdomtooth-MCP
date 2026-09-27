@@ -1,0 +1,12 @@
+.git
+.github
+.venv*
+**/__pycache__
+.pytest_cache
+.ruff_cache
+tests
+docs
+kilo-configs
+.kilocode
+dist
+build

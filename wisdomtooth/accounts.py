@@ -1,6 +1,6 @@
 """What each connected account has left, from the sources that actually say.
 
-- The Claude subscription reports its own meter: Claude Code streams a
+- Claude Code reports its own usage meter: it streams a
   `rate_limit_event` whose `unifiedWindows` give the 5-hour and 7-day
   utilization (0.0-1.0) and when each resets. That is a share of the plan,
   not a token count, so the meter also learns what a percentage point costs:

@@ -1,24 +1,18 @@
 // Merge into kilo.jsonc (project root) or your global kilo.json.
-// DEFAULT SETUP — subscription first, API credits only as a fallback.
-// Requires Claude Code installed and logged in: run `claude`, then /login with
-// your claude.ai (Pro/Max) account, and check `claude auth status`.
-// ANTHROPIC_API_KEY is optional: include it ONLY if you want consults to keep
-// working (on paid credits) after the plan's headless quota is exhausted.
+// DEFAULT SETUP: an Anthropic API key, billed per token.
+// Create a key at console.anthropic.com. Without one, Wisdomtooth uses your own
+// signed-in Claude Code install instead -- see kilo.claude-code.jsonc.
 {
   "mcp": {
     "wisdomtooth": {
       "type": "local",
       "command": ["wisdomtooth-mcp"],
       "environment": {
-        // "auto" is the default; stated here so the billing choice is visible.
-        "ADVISOR_BACKEND": "auto",
+        "ANTHROPIC_API_KEY": "sk-ant-your-key-here",
         "ADVISOR_MODEL": "balanced",
-        // Driving this from a LOCAL model? See kilo.local-models.jsonc
-        // and set these two -- they matter more than anything else here.
-        // "ADVISOR_MINIMAL_TOOLS": "1",
-        // "ADVISOR_ANSWER_BUDGET": "500",
+        // Driving this from a LOCAL model? See kilo.local-models.jsonc.
+        // "ADVISOR_PRESET": "small",
         "ADVISOR_EFFORT": "high"
-        // "ANTHROPIC_API_KEY": "sk-ant-..."   // optional fallback only
       },
       "enabled": true,
       // Kilo's per-request timeout, restarted by every progress notification.

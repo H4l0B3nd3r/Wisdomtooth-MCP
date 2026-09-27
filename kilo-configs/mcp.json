@@ -4,7 +4,7 @@
       "command": "wisdomtooth-mcp",
       "args": [],
       "env": {
-        "ADVISOR_BACKEND": "auto",
+        "ANTHROPIC_API_KEY": "sk-ant-your-key-here",
         "ADVISOR_MODEL": "deep"
       },
       "disabled": false,

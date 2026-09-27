@@ -1,4 +1,5 @@
-# Publishes to PyPI when a version tag (v0.11.1, ...) is pushed. Uses PyPI
+# Publishes to PyPI and the container image to ghcr.io when a version tag
+# (v0.13.0, ...) is pushed. PyPI uses
 # trusted publishing, so no token is stored in the repository: configure the
 # project on pypi.org once (Publishing -> add a GitHub publisher: this
 # repository, workflow `release.yml`, environment `pypi`).
@@ -41,3 +42,43 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  # The container image, on GitHub's registry (no account setup needed). The
+  # name is spelled out lowercase: registry names may not contain capitals.
+  docker:
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    env:
+      IMAGE: ghcr.io/h4l0b3nd3r/wisdomtooth-mcp
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@9ec57ed1fcdbf14dcef7dfbe97b2010124a938b7
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+      - id: push
+        uses: docker/build-push-action@f2a1d5e99d037542a71f64918e516c093c6f3fc4
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+      - uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

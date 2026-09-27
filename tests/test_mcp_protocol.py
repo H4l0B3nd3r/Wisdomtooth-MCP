@@ -17,8 +17,7 @@ PKG_ROOT = Path(__file__).resolve().parents[1]
 
 EXPECTED_TOOLS = {"ask_wisdomtooth", "review_code", "compare_approaches",
                   "advisor_status", "advisor_auth_check", "advisor_models",
-                  "advisor_configure", "advisor_login", "advisor_set_token",
-                  "advisor_logout", "advisor_usage", "multi_advisor",
+                  "advisor_configure", "advisor_usage", "multi_advisor",
                   "advisor_connect", "advisor_disconnect"}
 
 
@@ -267,11 +266,11 @@ async def test_input_rejections_keep_their_guidance(fake_claude):
     X". A validation error whose whole value is telling the user what to do
     instead has to reach them intact."""
     async with advisor_session(fake_claude) as session:
-        result, text = await _call(session, "advisor_set_token",
-                                   {"token": "claude setup-token"})
+        result, text = await _call(session, "advisor_connect",
+                                   {"name": "Bad Name!", "provider": "openai"})
         assert field(result, "isError", "is_error") is True
-        assert "setup-token" in text
-        assert text.strip() != "Error executing tool advisor_set_token"
+        assert "lowercase" in text
+        assert text.strip() != "Error executing tool advisor_connect"
 
 
 async def test_configure_rejections_keep_their_guidance(fake_claude):

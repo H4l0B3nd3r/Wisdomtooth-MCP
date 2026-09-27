@@ -43,7 +43,7 @@ go to the user for a decision; never set confirm_over_limit on your own.
 
 
 def answer_budget_instruction(budget: int) -> str:
-    """The only length control that works on the subscription backend.
+    """The only length control that works on the Claude Code backend.
 
     `max_tokens` is an API-only parameter; the Claude Code CLI has no
     equivalent flag, so on that backend the system prompt is the sole lever.
@@ -72,42 +72,19 @@ def trim_note(kept_words: int, total_words: int, budget: int) -> str:
 
 
 AUTH_HELP = (
-    "AUTH FAILURE from the claude CLI -- this CANNOT be fixed headlessly or by "
-    "retrying; OAuth login requires a human. Tell the user to do ONE of the "
-    "following on this machine: (a) open a terminal, run `claude`, then "
-    "`/login`, choose the claude.ai (Pro/Max) account, and confirm "
-    "`claude auth status` shows it; or (b) for durable headless auth, run "
-    "`claude setup-token` once and put the resulting token in the MCP server "
-    "env as CLAUDE_CODE_OAUTH_TOKEN. Also ensure no ANTHROPIC_API_KEY lingers "
-    "in shell profiles. Then re-run advisor_auth_check. CLI said: "
-)
-
-MANUAL_LOGIN = (
-    "Connect the account manually instead — either works:\n"
-    "  A. Interactive (simplest if you have a terminal on this machine):\n"
-    "       claude auth login --claudeai\n"
-    "     Complete the browser sign-in, then call advisor_login again to "
-    "confirm.\n"
-    "  B. Headless / GUI-launched editor (survives everything, recommended for "
-    "a server your editor starts):\n"
-    "       claude setup-token\n"
-    "     Then pass the token it prints to the advisor_set_token tool. The "
-    "advisor stores it privately and uses it immediately — no MCP config edit "
-    "and no server restart."
+    "AUTH FAILURE from the claude CLI -- this cannot be fixed by retrying; a "
+    "person has to sign in. Tell the user to do ONE of these on this machine: "
+    "(a) open a terminal, run `claude`, and sign in; or (b) set "
+    "ANTHROPIC_API_KEY in the MCP server env to use the Anthropic API "
+    "instead. Then re-run advisor_auth_check. CLI said: "
 )
 
 NO_CREDENTIALS = (
     "No usable Claude credentials on this machine, so the advisor cannot run.\n"
-    "EASIEST FIX -- call the `advisor_login` tool. It opens the Claude sign-in "
-    "on the user's desktop and connects their SUBSCRIPTION (Pro/Max), which "
-    "costs nothing per token. It applies immediately: no config edit, no server "
-    "restart.\n"
-    "If this machine has no desktop (headless, container, SSH), have the user "
-    "run `claude setup-token` in a terminal and pass the result to the "
-    "`advisor_set_token` tool.\n"
-    "Alternative, only if the user has no Claude subscription: set "
-    "ANTHROPIC_API_KEY in the MCP server env and restart the server entry -- "
-    "that bills their developer Console account per token.\n"
-    "A human has to complete one of these -- do not retry the consult until "
-    "they have."
+    "Either: set ANTHROPIC_API_KEY in the MCP server env (a key from "
+    "console.anthropic.com; billed per token) and restart the server entry; "
+    "or, if Claude Code is installed, sign in to it by running `claude` in a "
+    "terminal -- Wisdomtooth then uses that install.\n"
+    "A person has to do one of these -- do not retry the consult until they "
+    "have."
 )

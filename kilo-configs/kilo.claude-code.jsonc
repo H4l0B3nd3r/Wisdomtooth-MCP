@@ -1,0 +1,22 @@
+// YOUR OWN CLAUDE CODE INSTALL: consults run the `claude` CLI you installed,
+// signed in however you signed it in (run `claude` once to sign in).
+// Wisdomtooth never signs in to anything; ANTHROPIC_API_KEY is removed from
+// the CLI's environment so it uses that sign-in.
+{
+  "mcp": {
+    "wisdomtooth": {
+      "type": "local",
+      "command": ["wisdomtooth-mcp"],
+      "environment": {
+        "ADVISOR_BACKEND": "claude-code",
+        "ADVISOR_MODEL": "balanced",
+        // Driving this from a LOCAL model? See kilo.local-models.jsonc.
+        // "ADVISOR_PRESET": "small",
+        // Absolute path, if a GUI-launched editor cannot find `claude`:
+        "ADVISOR_CLAUDE_BIN": ""
+      },
+      "enabled": true,
+      "timeout": 300000
+    }
+  }
+}

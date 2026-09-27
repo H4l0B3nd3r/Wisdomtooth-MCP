@@ -263,7 +263,6 @@ def test_every_home_path_goes_through_state_dir(server, fake_home, monkeypatch):
     # default instead of the temp directory every other test wants.
     monkeypatch.delenv("ADVISOR_CONSULT_DIR", raising=False)
     root = srv._state_dir()
-    assert srv._credentials_path().startswith(root)
     assert srv._consult_dir().startswith(root)
     assert srv._workdir().startswith(root)
     assert srv._system_prompt_file("x").startswith(root)

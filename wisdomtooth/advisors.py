@@ -1,7 +1,7 @@
 """Advisors: the named models a consult can go to.
 
 `claude` is always present and always the default unless the user picks
-another. It runs through the existing Claude backends (subscription CLI or
+another. It runs through the existing Claude backends (Claude Code CLI or
 API), so everything about billing Claude stays where it was.
 
 Every other advisor speaks the OpenAI chat-completions protocol, which covers

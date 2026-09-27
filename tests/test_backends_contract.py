@@ -11,7 +11,7 @@ def test_each_backend_declares_what_it_honours(server):
     api, cli = srv._BACKENDS["api"], srv._BACKENDS["claude-code"]
     assert api.honours_max_tokens is True
     assert cli.honours_max_tokens is False
-    assert cli.fallback == "api"
+    assert cli.fallback is None  # never moves the user onto paid credits
     assert api.fallback is None
 
 
@@ -40,8 +40,8 @@ def test_a_backend_that_ignores_max_tokens_says_so(server):
 def test_the_claude_footers_are_unchanged(server, fake_claude, monkeypatch):
     srv = server(ADVISOR_BACKEND="claude-code")
     answer = srv._consult(question="q", model="balanced", effort="high")
-    assert "[advisor: claude-code/sonnet · billed to SUBSCRIPTION · " \
-           "effort=high]" in answer
+    assert "[advisor: claude-code/sonnet · billed to your own Claude Code " \
+           "sign-in · effort=high]" in answer
 
     srv = server(ADVISOR_BACKEND="api", ANTHROPIC_API_KEY="k")
     monkeypatch.setattr(srv, "_consult_api", lambda *args: "api answer")

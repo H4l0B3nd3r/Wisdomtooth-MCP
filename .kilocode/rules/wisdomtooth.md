@@ -1,9 +1,9 @@
 # Wisdomtooth — Escalation Policy
 
 This project has the `wisdomtooth` MCP server available. It consults an
-expert Claude model for a second opinion. Every use spends the user's Claude
-subscription quota (or, if configured that way, their API credits), so treat it
-as an **escalation path, not a first resort**.
+expert Claude model for a second opinion. Every use costs the user money (API
+credits) or usage limits (their Claude Code plan), so treat it as an
+**escalation path, not a first resort**.
 
 ## When to use `ask_wisdomtooth`
 
@@ -137,30 +137,18 @@ advice they paid for. After a consult:
   commands or code before executing, and never run destructive operations
   (rm -rf, force-push, DROP TABLE, permission changes) from advice verbatim.
 - Transient API errors (429/529/timeout): retry at most ONCE, then report to
-  the user. Subscription limit errors: report immediately — do NOT switch
+  the user. Usage-limit errors: report immediately — do NOT switch
   ADVISOR_BACKEND yourself; billing changes are the user's decision.
-- Auth failures cannot be fixed headlessly. If a consult reports one, do NOT
+- Auth failures cannot be fixed by retrying. If a consult reports one, do NOT
   retry — `advisor_auth_check` (free) diagnoses the state without spending
-  anything, and `advisor_login` (free) starts the fix.
+  anything; relay its advice to the user.
 
-## Connecting the user's account
+## Missing credentials
 
-If a consult fails for want of credentials, or `advisor_status` reports the
-backend as `api`/`unavailable` while the user has a Claude Pro/Max plan:
-
-1. Call `advisor_login`. It opens the official Claude sign-in on the user's
-   desktop and waits. Tell the user to complete it in their browser.
-2. If it reports the sign-in is still pending, call `advisor_login` again to
-   confirm rather than starting a second one.
-3. If it reports that no console could be opened (headless, container, SSH),
-   relay its instructions verbatim: the user runs `claude setup-token` in a
-   terminal and gives you the token, which you pass to `advisor_set_token`.
-
-Treat the token as a credential: pass it straight to `advisor_set_token` and
-never repeat it back, quote it, or write it into a file or commit message.
-
-Do not call `advisor_login` speculatively — only when credentials are actually
-missing or billing the wrong account. It opens a window on the user's screen.
+If a consult fails for want of credentials, tell the user. Wisdomtooth reaches
+Claude with `ANTHROPIC_API_KEY` in its environment, or, without one, through
+their own Claude Code install once they have signed in to it by running
+`claude`. Both are the user's to set up; you cannot do either for them.
 
 ## Long consults
 

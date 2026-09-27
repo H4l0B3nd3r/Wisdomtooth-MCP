@@ -14,13 +14,13 @@ back. That model is Claude by default. You can connect others alongside it
 (ChatGPT, Gemini, OpenRouter, or a local model) and let the agent ask one of
 them, or two or three at once. See "Other advisors" below.
 
-**It spends your Claude subscription, not API credits.** Consults run through
-your logged-in Claude Code CLI, so a Pro or Max plan covers them at no
-per-token cost.
+**It reaches Claude with your Anthropic API key**, or, if you have none set,
+through your own signed-in Claude Code install. Each answer says which one
+paid.
 
 It is deliberately an **escalation path**, not a chat window. A local model that
-called Claude for every question would be slow, would burn your plan's headless
-quota, and would stop thinking for itself. Three mechanisms hold that line:
+called Claude for every question would be slow, would run up your bill or
+your usage limits, and would stop thinking for itself. Three mechanisms hold that line:
 
 - Every tool description opens with explicit WHEN TO USE / DO NOT USE criteria.
 - `ask_wisdomtooth` cannot be called without an `attempts_so_far` argument
@@ -34,29 +34,22 @@ quota, and would stop thinking for itself. Three mechanisms hold that line:
 ### 1. Install
 
 ```bash
-uv tool install git+https://github.com/H4l0B3nd3r/Wisdomtooth-MCP
+uv tool install wisdomtooth-mcp
 ```
 
-You also need the Claude Code CLI on PATH — that is what talks to your
-subscription. Get it from <https://claude.com/claude-code>.
+(Or run the Docker image; see the README.)
 
-### 2. Connect your Claude account
+### 2. Give it a way to reach Claude
 
-Ask your agent to call **`advisor_login`**. A console window opens running the
-official Claude sign-in; finish it in your browser and the advisor switches to
-subscription billing immediately — no config file, no restart.
+Either:
 
-If the machine has no desktop (a container, a remote box, SSH), run this in a
-terminal instead:
-
-```bash
-claude setup-token
-```
-
-…and give the printed token to **`advisor_set_token`**. It is saved to
-`~/.wisdomtooth/credentials.json` with owner-only permissions and injected
-into every consult, so it survives restarts and the reduced environment a
-GUI-launched editor hands to its MCP servers.
+- **An API key** — create one at <https://console.anthropic.com> and put it in
+  the server's environment as `ANTHROPIC_API_KEY` (step 3 shows where). Billed
+  per token.
+- **Your own Claude Code install** — install
+  [Claude Code](https://claude.com/claude-code) and sign in by running `claude`
+  once. With no API key set, Wisdomtooth uses that install as you signed it
+  in. It never signs in to anything itself.
 
 ### 3. Add it to your client
 
@@ -69,7 +62,7 @@ GUI-launched editor hands to its MCP servers.
       "type": "local",
       "command": ["wisdomtooth-mcp"],
       "environment": {
-        "ADVISOR_BACKEND": "claude-code",
+        "ANTHROPIC_API_KEY": "sk-ant-...",   // omit to use your Claude Code install
         "ADVISOR_PRESET": "small"
       },
       "enabled": true,
@@ -79,16 +72,16 @@ GUI-launched editor hands to its MCP servers.
 }
 ```
 
-**Claude Code** — `claude mcp add wisdomtooth -- wisdomtooth-mcp`
+**Claude Code** — `claude mcp add wisdomtooth --env ANTHROPIC_API_KEY=sk-ant-... -- wisdomtooth-mcp`
 
 **Cursor / Windsurf / Cline / Claude Desktop** — standard `mcpServers` JSON with
-command `wisdomtooth-mcp`.
+command `wisdomtooth-mcp`; `wisdomtooth-mcp doctor` prints one for your client.
 
 Then copy `.kilocode/rules/wisdomtooth.md` into your project's
 `.kilocode/rules/` so the agent gets the escalation policy as a standing rule.
 
-Verify with **`advisor_status`**. You want `active backend: claude-code` and
-`billing: Claude SUBSCRIPTION`.
+Verify with **`advisor_status`**: `active backend: api` with a key, or
+`claude-code` when it uses your Claude Code install.
 
 ---
 
@@ -127,7 +120,7 @@ measurably improves tool-selection accuracy in small models.
 Claude's answer lands **inside your local model's context**. An unbounded Opus
 answer can be larger than an 8B model's entire window. This sets a ceiling in
 words (from the preset: 600 / 2,000 / 64,000) and is enforced through the
-system prompt, which is the only lever that works on the subscription backend
+system prompt, which is the only lever that works on the Claude Code backend
 — the Claude Code CLI has no `max_tokens` flag. Claude is told it is a
 ceiling, not a target, and to size each answer to the question.
 
@@ -137,13 +130,14 @@ ceiling, not a target, and to size each answer to the question.
 - `64000` — the `large` preset; frontier callers with large windows
 - `0` — no limit
 
-`max_tokens` also exists but is **API-backend only**; on the subscription
+`max_tokens` also exists but is **API-backend only**; on the Claude Code
 backend the footer will tell you it was ignored.
 
 ### `ADVISOR_MODEL` — which Claude answers
 
 Default is `balanced` (Sonnet). A local model escalates often, and putting every
-one of those on Opus exhausts a Pro plan's headless quota quickly.
+one of those on Opus costs several times as much, or uses up a Claude Code
+plan's limits quickly.
 
 | Tier | Model | Use for |
 |---|---|---|
@@ -187,12 +181,13 @@ the current token ceiling. Free — no model call.
 Every answer ends with a line like:
 
 ```
-[advisor: claude-code/sonnet · billed to SUBSCRIPTION · effort=high]
+[advisor: claude-sonnet-5 · billed to API ACCOUNT · max_tokens=64000]
 [saved: C:\Users\you\.wisdomtooth\consults\20260209-142233-ask-wisdomtooth-why-does-the-datagrid-flicker.md — ...]
 ```
 
-The first line is your audit trail. If it says `billed to API ACCOUNT`, you are
-spending per-token credits — check `advisor_status`.
+The first line is your audit trail: `billed to API ACCOUNT` is your Anthropic
+API key, `billed to your own Claude Code sign-in` is your Claude Code install.
+`advisor_status` shows which one `auto` picked.
 
 ### Reading the answer yourself
 
@@ -307,10 +302,10 @@ method, stored token, and whether anything is hijacking billing.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| "No usable Claude credentials" | Never connected | `advisor_login` |
-| `billing: DEVELOPER API account` unexpectedly | `ANTHROPIC_API_KEY` set, or CLI logged in with `--console` | Unset the key, or `advisor_login(force=true)` |
-| AUTH FAILURE mid-session | Logged out or token revoked | `advisor_login` — a human must complete OAuth; retrying never helps |
-| "usage limit is exhausted" | Plan's headless quota spent | Wait for reset, or add an API key and use `ADVISOR_BACKEND=auto` |
+| "No usable Claude credentials" | No key, and Claude Code missing or signed out | Set `ANTHROPIC_API_KEY`, or run `claude` and sign in |
+| Billed to the API when you meant Claude Code | `ANTHROPIC_API_KEY` is set, and `auto` prefers it | Remove the key, or set `ADVISOR_BACKEND=claude-code` |
+| AUTH FAILURE mid-session | Key revoked, or Claude Code signed out | Fix the key, or run `claude` and sign in; retrying never helps |
+| "usage limit is reached" | Claude Code's plan limit | Wait for the reset, or set an API key |
 | Consult times out | Not logged in, or a first-run prompt is blocking | Run `claude` interactively once, then `advisor_auth_check` |
 | "Consult cap reached" | A cap you set in `ADVISOR_MAX_CONSULTS_PER_*` | Wait for the time given, or raise the cap |
 | "context_files is unavailable" | The server runs from your home folder | Set `ADVISOR_FILE_ROOTS` to the project path |
@@ -330,8 +325,9 @@ while it is still alive; stop the server entry first.
 
 ## Cost and safety
 
-- **Subscription consults cost no money**, but they do draw on your plan's
-  headless (non-interactive) quota, which is separate from interactive use.
+- **API consults are billed per token**; the footer and `advisor_usage` show
+  what each cost. Consults through Claude Code count against that install's
+  plan limits instead.
 - **`ADVISOR_LOCK=1`** pins model, effort and token budget so the agent cannot
   raise them. Use on shared machines or when handing this to an agent you do not
   yet trust.
@@ -343,8 +339,8 @@ while it is still alive; stop the server entry first.
 - Obvious secrets (API keys, tokens, private key blocks, `password=`) are
   redacted from outbound content, and `context` is capped at 60k characters.
   That is a seatbelt, not a guarantee — do not paste `.env` files.
-- Keep `advisor_login` off any auto-approve list. It opens a window on your
-  desktop, and a confused model should not be able to do that unprompted.
+- Keep `advisor_connect` off any auto-approve list: it stores keys and adds
+  accounts that consults will bill.
 
 ---
 

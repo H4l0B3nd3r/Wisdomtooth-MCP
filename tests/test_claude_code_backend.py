@@ -186,9 +186,9 @@ def test_stripping_can_be_opted_out_of(server, fake_claude):
     assert fake_claude.last["env"]["ANTHROPIC_API_KEY"] == "sk-ant-keep"
 
 
-def test_footer_names_the_subscription_as_the_payer(server, fake_claude):
+def test_footer_names_the_users_own_install_as_the_payer(server, fake_claude):
     srv = server(ADVISOR_BACKEND="claude-code")
-    assert "SUBSCRIPTION" in consult(srv)
+    assert "your own Claude Code sign-in" in consult(srv)
 
 
 # --------------------------------------------------------------------------

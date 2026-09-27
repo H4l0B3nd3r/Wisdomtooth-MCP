@@ -29,7 +29,7 @@ class AdvisorInputError(AdvisorError, ValueError):
 
 
 class UsageLimitError(AdvisorError):
-    """The subscription's headless quota is exhausted. Not retryable."""
+    """Claude Code reports its usage limit is reached. Not retryable."""
 
 
 class OverLimitError(AdvisorError):

@@ -49,16 +49,18 @@ test fail, read the test's docstring before changing the test.
 
 ## Billing
 
-- **`auto` prefers the logged-in CLI.** `loggedIn` is not enough on its own:
-  a CLI signed in with an API key bills the Console account, which is why
-  `advisor_auth_check` reports `authMethod`.
+- **`auto` prefers API credentials**, detected the way the Anthropic SDK
+  finds them, and uses the user's own Claude Code install only when there are
+  none and it is signed in.
+- **The server signs in to nothing and stores no Claude credential.** Anthropic
+  does not allow third-party products to offer claude.ai login or use its
+  plan limits without approval, so the Claude Code backend runs the user's
+  install exactly as they set it up. Do not add a login flow or a token store.
 - **`ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` are removed from the CLI's
-  environment**, because Claude Code prefers them over the subscription.
-  `CLAUDE_CODE_OAUTH_TOKEN` is kept, and the token stored by
-  `advisor_set_token` is injected in its place.
-- **Only `auto` falls back to API credits**, and only when the plan's quota
-  is exhausted. An explicit `claude-code` backend reports the limit instead:
-  moving someone onto paid credits is their decision.
+  environment**, so an explicit `claude-code` backend uses the install's own
+  sign-in. `CLAUDE_CODE_OAUTH_TOKEN`, if the user set one, passes through.
+- **Nothing moves the user onto paid credits.** Claude Code at its usage
+  limit fails the consult with a message; it never falls back to the API.
 - **The resolved backend is cached, except "unavailable"**, so credentials
   that appear after startup are noticed without a restart.
 - **A consult is held only on evidence**: a declared allowance, a full plan
@@ -81,7 +83,7 @@ test fail, read the test's docstring before changing the test.
   the event loop, so `tool()` wraps those in `asyncio.to_thread`.
 - **Slow tools send progress notifications.** Clients abort a silent call at
   their own timeout; Kilo restarts its timer on each notification.
-  `advisor_login` and `advisor_auth_check` use the same heartbeat as consults.
+  `advisor_auth_check` uses the same heartbeat as consults.
 - **The startup banner resolves the backend in a thread**, so the handshake
   never waits on `claude auth status`.
 - **Cancellation and usage travel in context variables.** `asyncio.to_thread`

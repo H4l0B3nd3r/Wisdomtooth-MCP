@@ -12,7 +12,7 @@
 //   - a 600-word answer ceiling. Claude's reply lands INSIDE the local model's
 //     context, and an unbounded answer can exceed a small model's whole
 //     window. Enforced via the system prompt, the only lever that works on the
-//     subscription backend (ADVISOR_MAX_TOKENS is API-backend only).
+//     Claude Code backend (ADVISOR_MAX_TOKENS is API-backend only).
 //
 // Use "medium" instead for 32k-200k context models.
 {
@@ -21,14 +21,14 @@
       "type": "local",
       "command": ["wisdomtooth-mcp"],
       "environment": {
-        // Subscription only. Never silently spends API credits.
-        "ADVISOR_BACKEND": "claude-code",
+        // An Anthropic API key; omit it to use your own Claude Code install.
+        "ANTHROPIC_API_KEY": "sk-ant-your-key-here",
 
         // Sized for a small caller.
         "ADVISOR_PRESET": "small",
 
         // Sonnet by default: a local model escalates often, and Opus on every
-        // consult exhausts a Pro plan's headless quota. The agent can still
+        // consult costs several times as much. The agent can still
         // pass model="deep" per call for the hard ones.
         "ADVISOR_MODEL": "balanced",
         "ADVISOR_EFFORT": "high"

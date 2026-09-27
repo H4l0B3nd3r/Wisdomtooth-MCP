@@ -11,7 +11,7 @@ DEFAULT_TIERS = {
     "deep": "claude-opus-5",        # architecture and stubborn bugs
 }
 
-# Claude Code CLI model aliases for the subscription backend.
+# Claude Code CLI model aliases for the claude-code backend.
 CLAUDE_CODE_ALIASES = {"fast": "haiku", "balanced": "sonnet", "deep": "opus"}
 
 VALID_EFFORT = ("low", "medium", "high", "xhigh", "max")

@@ -5,6 +5,28 @@ All notable changes to this project are listed here. The format follows
 [semantic versioning](https://semver.org/) (pre-1.0: a minor version may
 change behaviour).
 
+## [0.13.0] - 2026-09-27
+
+The first public release.
+
+### Changed
+- **An Anthropic API key is the default way to reach Claude.** `auto` now
+  prefers API credentials (`ANTHROPIC_API_KEY`, or an Anthropic SDK profile)
+  and uses your own signed-in Claude Code install only when there are none.
+- The server no longer signs in to anything or stores a Claude credential:
+  `advisor_login`, `advisor_set_token` and `advisor_logout` are removed, and a
+  token stored by an earlier version is no longer read. Sign in to Claude
+  Code yourself by running `claude`, or set `CLAUDE_CODE_OAUTH_TOKEN` in its
+  environment.
+- `ADVISOR_FALLBACK_TO_API` is removed: nothing moves you onto paid credits.
+  Claude Code at its usage limit fails the consult with a message.
+- Example configs: `kilo.jsonc` uses an API key; `kilo.subscription.jsonc` is
+  now `kilo.claude-code.jsonc`; `kilo.api.jsonc` is folded into `kilo.jsonc`.
+
+### Added
+- A Docker image, `ghcr.io/h4l0b3nd3r/wisdomtooth-mcp`, published with each
+  release.
+
 ## [0.12.0] - 2026-09-27
 
 ### Added
@@ -192,6 +214,7 @@ change behaviour).
   cap, UTF-8 subprocess I/O on Windows, `--strict-mcp-config` isolation, and
   process-tree cleanup on timeout.
 
+[0.13.0]: https://github.com/H4l0B3nd3r/Wisdomtooth-MCP/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/H4l0B3nd3r/Wisdomtooth-MCP/compare/v0.11.2...v0.12.0
 [0.11.2]: https://github.com/H4l0B3nd3r/Wisdomtooth-MCP/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/H4l0B3nd3r/Wisdomtooth-MCP/compare/19104c6...v0.11.1

@@ -15,7 +15,7 @@ from typing import Optional
 from . import storage
 
 # USD per million tokens (input, output) at first-party API rates, matched by
-# longest prefix. Used only to *estimate*: a subscription consult is not billed
+# longest prefix. Used only to *estimate*: a Claude Code consult is not billed
 # per token, and when the CLI reports its own API-equivalent figure that wins.
 # An unlisted model gets no estimate rather than a wrong one.
 PRICES_PER_MTOK = {

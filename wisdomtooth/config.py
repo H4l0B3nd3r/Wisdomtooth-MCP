@@ -62,7 +62,6 @@ CONFIG_KEYS = {
     "progress_interval": "ADVISOR_PROGRESS_INTERVAL",
     "max_context_chars": "ADVISOR_MAX_CONTEXT_CHARS",
     "max_budget_usd": "ADVISOR_MAX_BUDGET_USD",
-    "fallback_to_api": "ADVISOR_FALLBACK_TO_API",
     "lock": "ADVISOR_LOCK",
     "nsfw_scrub": "ADVISOR_NSFW_SCRUB",
     "transport": "ADVISOR_TRANSPORT",
@@ -188,12 +187,11 @@ class Settings:
     preset: str = DEFAULT_PRESET
     preset_values: Mapping = field(default_factory=dict)
     # Backend -- WHO GETS BILLED
-    # "auto"        -> (default) the local `claude` CLI when it is installed
-    #                  and logged in, which draws on the Claude SUBSCRIPTION
-    #                  (Pro/Max); otherwise ANTHROPIC_API_KEY.
-    # "claude-code" -> always the CLI. Never silently spends API credits.
-    # "api"         -> always the Anthropic API. Bills the DEVELOPER CONSOLE
-    #                  account per token, not the subscription.
+    # "auto"        -> (default) the Anthropic API when credentials exist
+    #                  (ANTHROPIC_API_KEY or an SDK profile); otherwise the
+    #                  user's own Claude Code install, if it is signed in.
+    # "claude-code" -> always the user's Claude Code install.
+    # "api"         -> always the Anthropic API, billed per token.
     backend: str = "auto"
     # "stdio" (the client launches the server on demand) or "http" (a
     # persistent server, e.g. in a container).
@@ -217,7 +215,6 @@ class Settings:
     # Seconds between keep-alive progress notifications. Clients restart
     # their request timeout on each one, so it must stay well under it.
     progress_interval: int = 15
-    fallback_to_api: bool = True
     max_budget_usd: Optional[str] = None
     # The answer's length ceiling, in words. 0 removes it.
     answer_budget: int = 2000
@@ -290,7 +287,6 @@ def load_settings(environ: Optional[Mapping] = None,
         timeout_max=max(timeout, src.integer("timeout_max", 3600)),
         idle_timeout=max(0.0, src.number("idle_timeout", 300.0)),
         progress_interval=max(1, src.integer("progress_interval", 15)),
-        fallback_to_api=src.flag("fallback_to_api", True),
         max_budget_usd=src.raw("max_budget_usd"),
         answer_budget=max(0, src.integer("answer_budget", 2000)),
         trim_answers=src.flag("trim_answers", True),

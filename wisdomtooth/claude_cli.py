@@ -11,9 +11,7 @@ import contextvars
 import json
 import os
 import queue
-import shutil
 import subprocess
-import sys
 import threading
 import time
 from typing import Optional
@@ -208,7 +206,7 @@ class StreamState:
         self.phase = ""
         self.chars = 0
         # The plan's own meter: Claude Code 2.1.x streams a `rate_limit_event`
-        # with the 5-hour and 7-day utilization of the subscription.
+        # with the 5-hour and 7-day utilization of the account's plan.
         self.rate_limit: Optional[dict] = None
 
     def feed(self, line: str) -> None:
@@ -361,39 +359,3 @@ def parse_output(stdout: str):
     if not isinstance(payload, dict):
         return text, None
     return str(payload.get("result", "")), payload
-
-
-def spawn_login_console(cmd: list) -> str:
-    """Open `cmd` in a console window the user can see and interact with.
-
-    The CLI's OAuth flow needs a real console it can own -- piping its stdio
-    would strand the user halfway through a browser handshake with nothing to
-    type into. Returns a short description of what was opened. Raises if the
-    machine has no desktop to put a window on (headless server, container,
-    plain SSH).
-    """
-    if os.name == "nt":
-        flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
-        subprocess.Popen(wrap_for_windows(list(cmd)), creationflags=flags,
-                         close_fds=True)
-        return "a new console window"
-
-    if sys.platform == "darwin":
-        script = " ".join(f"'{part}'" for part in cmd)
-        subprocess.Popen(
-            ["osascript", "-e",
-             f'tell application "Terminal" to do script "{script}"',
-             "-e", 'tell application "Terminal" to activate'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return "a new Terminal window"
-
-    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
-        raise RuntimeError("no graphical session")
-    for term, flag in (("x-terminal-emulator", "-e"), ("gnome-terminal", "--"),
-                       ("konsole", "-e"), ("xfce4-terminal", "-x"),
-                       ("xterm", "-e")):
-        if shutil.which(term):
-            subprocess.Popen([term, flag] + list(cmd), start_new_session=True,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return f"a new {term} window"
-    raise RuntimeError("no terminal emulator found")

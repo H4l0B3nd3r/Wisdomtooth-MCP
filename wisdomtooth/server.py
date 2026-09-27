@@ -10,10 +10,10 @@ ChatGPT, Gemini, OpenRouter, or a local model in LM Studio or Ollama, anything
 that speaks the OpenAI chat-completions protocol -- and chosen per consult
 with `advisor=`, or asked together with `multi_advisor`.
 
-Billing, in one line: by default the server uses the user's Claude
-subscription via the local Claude Code CLI, and only falls back to
-pay-per-token API credits when the subscription is not usable. Every answer
-says which account paid for it.
+Billing, in one line: Claude consults use ANTHROPIC_API_KEY (the Anthropic
+API, per token). Without a key, they run through the user's own Claude Code
+install, signed in however the user signed it in. Every answer says which
+account paid for it.
 
 This module is the composition root: it loads the settings, builds the MCP
 server and wires the parts together. Each part lives in a module of its own
@@ -33,7 +33,7 @@ and takes what it needs as arguments:
   doctor       the `wisdomtooth-mcp doctor` command
 
 Run:
-    wisdomtooth-mcp            # auto: subscription first, API as fallback
+    wisdomtooth-mcp            # auto: API key first, else your Claude Code
     wisdomtooth-mcp doctor     # check the setup, print a client config
 """
 
@@ -70,12 +70,11 @@ except ImportError:  # mcp 1.x
 from mcp.types import ToolAnnotations
 
 from . import (accounts, advisors, claude_cli, cli_advisors, config, doctor,
-               httpauth, models, openai_compat, prompts, safety, storage,
-               transcripts, usage)
+               httpauth, models, openai_compat, prompts, safety, transcripts,
+               usage)
 from .backends import Backend
 from .claude_cli import CANCELLATION as _CANCELLATION
 from .claude_cli import Cancellation as _Cancellation
-from .claude_cli import spawn_login_console as _spawn_login_console
 from .config import CONFIG_KEYS
 from .errors import (AdvisorError, AdvisorInputError, OverLimitError,
                      UsageLimitError)
@@ -135,11 +134,6 @@ TIMEOUT_SCALE = SETTINGS.timeout_scale
 TIMEOUT_MAX = SETTINGS.timeout_max
 IDLE_TIMEOUT = SETTINGS.idle_timeout
 PROGRESS_INTERVAL = SETTINGS.progress_interval
-# In "auto" mode only, a consult that fails because the subscription's headless
-# quota is exhausted may be retried on API credits. Ignored for an explicit
-# "claude-code" backend: choosing the subscription is a billing decision, and
-# quietly moving the user onto paid credits is not the server's call.
-FALLBACK_TO_API = SETTINGS.fallback_to_api
 MAX_BUDGET_USD = SETTINGS.max_budget_usd
 ANSWER_BUDGET = SETTINGS.answer_budget
 TRIM_ANSWERS = SETTINGS.trim_answers
@@ -400,79 +394,6 @@ def _sdk_profile_path() -> Optional[str]:
         return None
     path = os.path.join(base, "configs", profile + ".json")
     return path if os.path.isfile(path) else None
-
-
-# ---------------------------------------------------------------------------
-# Subscription credentials (OAuth)
-# ---------------------------------------------------------------------------
-# OAuth needs a human at a browser, so the server cannot mint a credential on
-# its own. What it can do is drive the official CLI flow and then *keep* the
-# result, so connecting an account is a one-time act rather than a hand-edit of
-# the MCP client's JSON followed by a server restart.
-
-def _credentials_path() -> str:
-    return os.path.join(_state_dir(), "credentials.json")
-
-
-def _read_credentials() -> dict:
-    path = _credentials_path()
-    if not os.path.isfile(path):
-        return {}
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data if isinstance(data, dict) else {}
-    except Exception as exc:  # a broken store must never stop the server
-        print(f"[wisdomtooth] ignoring {path}: {exc}", file=sys.stderr)
-        return {}
-
-
-def _oauth_token() -> Optional[str]:
-    """The subscription token to hand the CLI, env first, then the store."""
-    return (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-            or _read_credentials().get("claude_code_oauth_token") or None)
-
-
-def _set_oauth_token(token: str) -> str:
-    """Persist a `claude setup-token` credential and apply it immediately."""
-    token = (token or "").strip()
-    if not token:
-        raise AdvisorInputError("no token given. Run `claude setup-token` in a "
-                         "terminal and pass the value it prints.")
-    if len(token.split()) > 1 or token.startswith("claude "):
-        raise AdvisorInputError(
-            "that looks like a command, not a token. Run `claude setup-token` "
-            "in a terminal and pass only the token it prints back.")
-
-    path = _credentials_path()
-    with storage.locked(path):
-        data = _read_credentials()
-        data["claude_code_oauth_token"] = token
-        storage.write_atomic(path, json.dumps(data), private=True)
-
-    _invalidate_backend()
-    return (f"Subscription token saved to {path} (owner-only) and applied to "
-            "this server immediately — no restart needed. Consults will now "
-            "bill the Claude subscription. Run advisor_status to confirm.")
-
-
-def _clear_oauth_token() -> str:
-    """Forget the stored token. Does not touch the CLI's own login state."""
-    path = _credentials_path()
-    with storage.locked(path):
-        data = _read_credentials()
-        had = data.pop("claude_code_oauth_token", None)
-        if data:
-            storage.write_atomic(path, json.dumps(data), private=True)
-        elif os.path.isfile(path):
-            os.remove(path)
-    _invalidate_backend()
-    if not had:
-        return ("No advisor-stored subscription token to remove. If the CLI "
-                "itself is logged in, run `claude auth logout` in a terminal.")
-    return (f"Removed the stored subscription token from {path}. The Claude "
-            "Code CLI's own login (if any) is untouched — run "
-            "`claude auth logout` in a terminal to sign out completely.")
 
 
 # ---------------------------------------------------------------------------
@@ -933,21 +854,16 @@ def _cli_features(claude_bin: str) -> set:
 def _child_env() -> dict:
     """The environment for the CLI subprocess.
 
-    ANTHROPIC_API_KEY (API billing) and ANTHROPIC_AUTH_TOKEN (gateway bearer)
-    are removed, because when either is present Claude Code prioritizes it and
-    bills the developer API account instead of the subscription.
-    CLAUDE_CODE_OAUTH_TOKEN is KEPT: it is the long-lived headless
-    subscription credential minted by `claude setup-token`.
+    ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN are removed: `auto` only runs
+    the CLI when no key is set, and an explicit claude-code backend means the
+    user chose the CLI's own sign-in, which either variable would override.
+    Everything else, CLAUDE_CODE_OAUTH_TOKEN included, is the user's own
+    setup and passes through.
     """
     hijack = () if os.environ.get("ADVISOR_KEEP_AUTH_ENV") == "1" else (
         "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
     env = {k: v for k, v in os.environ.items() if k not in hijack}
     env[cli_advisors.NESTED_ENV] = "1"
-    # Inject the stored subscription token: a GUI-launched MCP client hands us
-    # a reduced environment, so inheriting it is not enough.
-    token = _oauth_token()
-    if token:
-        env["CLAUDE_CODE_OAUTH_TOKEN"] = token
     return env
 
 
@@ -1008,8 +924,7 @@ def _consult_claude_code(system: str, user_content: str, model: str,
                          effort: Optional[str]) -> str:
     """Route the question through the local Claude Code CLI (headless).
 
-    Bills subscription entitlements as long as Claude Code is logged in with a
-    claude.ai account. The prompt goes on stdin, never argv: Windows caps a
+    Uses whatever the user's Claude Code install is signed in with. The prompt goes on stdin, never argv: Windows caps a
     command line at ~32k characters (~8k through cmd.exe) and the context cap
     alone is 60k.
     """
@@ -1017,10 +932,9 @@ def _consult_claude_code(system: str, user_content: str, model: str,
     if not claude_bin:
         raise AdvisorError(
             "the `claude` CLI was not found on PATH. Install Claude Code and "
-            "log in with your Pro/Max account, or set ADVISOR_CLAUDE_BIN to "
-            "its absolute path (GUI editors often have a reduced PATH). To "
-            "use API credits instead, set ADVISOR_BACKEND=api and provide "
-            "ANTHROPIC_API_KEY."
+            "sign in by running `claude` once, or set ADVISOR_CLAUDE_BIN to "
+            "its absolute path (GUI editors often have a reduced PATH). Or "
+            "set ANTHROPIC_API_KEY and ADVISOR_BACKEND=api to use the API."
         )
 
     cli_model = _cli_model(model)
@@ -1098,9 +1012,9 @@ def _consult_claude_code(system: str, user_content: str, model: str,
             f"(limit sized for {len(user_content):,} characters of input, an "
             f"answer budget of {_effective_answer_budget() or 'unlimited'} "
             "words" + (f" and effort={effort}" if effort else "") + "). "
-            "Most likely causes, in order: (1) Claude Code is not logged in -- "
-            "run `claude` in a terminal, then `/login` with the claude.ai "
-            "(Pro/Max) account; (2) a first-run onboarding/trust prompt is "
+            "Most likely causes, in order: (1) Claude Code is not signed in -- "
+            "run `claude` in a terminal and sign in; (2) a first-run "
+            "onboarding/trust prompt is "
             "blocking -- run `claude` interactively once on this machine; "
             "(3) network issues; (4) the consult genuinely needs longer -- the "
             f"user can raise ADVISOR_TIMEOUT_MAX (now {TIMEOUT_MAX}s) or lower "
@@ -1139,10 +1053,10 @@ def _consult_claude_code(system: str, user_content: str, model: str,
                   or "").strip()[:500]
         if any(sig in blob for sig in _LIMIT_SIGNATURES):
             raise UsageLimitError(
-                "The Claude subscription's headless usage limit is exhausted, so "
-                "this consult could not run on the plan. This is not a bug and "
-                "retrying will not help -- tell the user, and let them decide "
-                "whether to wait for the reset or spend API credits. CLI said: "
+                "Claude Code reports that its usage limit is reached, so this "
+                "consult could not run. This is not a bug and retrying will not "
+                "help -- tell the user; they can wait for the limit to reset, or "
+                "set ANTHROPIC_API_KEY to use the API instead. CLI said: "
                 + detail)
         if any(sig in blob for sig in _AUTH_SIGNATURES):
             raise AdvisorError(prompts.AUTH_HELP + detail)
@@ -1194,8 +1108,8 @@ def _api_failure(exc: "anthropic.APIError") -> AdvisorError:
             "AUTH FAILURE on the API backend: ANTHROPIC_API_KEY is missing, "
             "invalid, or revoked. Verify it at console.anthropic.com and set "
             "it in the MCP server config env, then restart the server entry. "
-            "If the user intended SUBSCRIPTION billing, use "
-            "ADVISOR_BACKEND=claude-code (no API key needed). Do not retry "
+            "To use their own Claude Code install instead, the user can unset "
+            "the key or set ADVISOR_BACKEND=claude-code. Do not retry "
             f"until fixed. ({name})")
     if isinstance(exc, anthropic.RateLimitError):
         return AdvisorError(
@@ -1220,11 +1134,10 @@ def _consult_api(system: str, user_content: str, model: str,
     if not _api_credentials_present():
         raise AdvisorError(
             "the API backend needs credentials: ANTHROPIC_API_KEY is missing. "
-            "This bills the developer Console account per token -- get a key at "
-            "console.anthropic.com and set it in the MCP server config env, "
-            "then restart the server entry. If the user meant to use their "
-            "Claude SUBSCRIPTION instead, install Claude Code, run `claude` "
-            "and `/login`, and leave ADVISOR_BACKEND unset (auto)."
+            "Get a key at console.anthropic.com, set it in the MCP server "
+            "config env, then restart the server entry. Or, with Claude Code "
+            "installed and signed in, leave ADVISOR_BACKEND unset (auto) to "
+            "use that install."
         )
 
     kwargs = _build_kwargs(model, effort, max_tokens)
@@ -1299,12 +1212,20 @@ def _cli_auth_status() -> Optional[dict]:
         return None
 
 
+def _claude_code_signed_in() -> bool:
+    """Whether the user's own Claude Code install is there and signed in."""
+    if not _claude_bin():
+        return False
+    if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        return True
+    status = _cli_auth_status()
+    return bool(status and status.get("loggedIn"))
+
+
 def _invalidate_backend() -> None:
     """Force the next `auto` resolution to re-probe.
 
-    Connecting or disconnecting an account changes the answer, and the cached
-    value would otherwise keep the server on the old billing path until it
-    restarts -- which is precisely the friction the login flow exists to remove.
+    Used by tests and embedders that change the environment at runtime.
     """
     global _ACTIVE_BACKEND
     _ACTIVE_BACKEND = None
@@ -1321,94 +1242,16 @@ def _active_backend() -> str:
     with _BACKEND_LOCK:
         if _ACTIVE_BACKEND is not None:
             return _ACTIVE_BACKEND
-        status = _cli_auth_status()
-        if (status and status.get("loggedIn")) or (_oauth_token()
-                                                   and _claude_bin()):
-            resolved = "claude-code"
-        elif _api_credentials_present():
+        if _api_credentials_present():
             resolved = "api"
+        elif _claude_code_signed_in():
+            resolved = "claude-code"
         else:
             # Not cached: a user who signs in or sets a key after the server
             # started should not have to restart it.
             return "unavailable"
         _ACTIVE_BACKEND = resolved
         return resolved
-
-
-# ---------------------------------------------------------------------------
-# Connecting an account
-# ---------------------------------------------------------------------------
-
-# Seconds between "is the browser sign-in done yet?" checks. A module constant
-# so tests can drive the poll loop without patching the stdlib.
-_LOGIN_POLL_SECONDS = 3.0
-
-
-def _describe_account(status: dict) -> str:
-    return "account={} method={} plan={}".format(
-        status.get("email", "?"), status.get("authMethod", "?"),
-        status.get("subscriptionType", "?"))
-
-
-def _login(force: bool = False, wait_seconds: int = 180) -> str:
-    """Connect a Claude subscription account through the official OAuth flow."""
-    if not _claude_bin():
-        raise AdvisorError(
-            "Connecting a Claude subscription needs the Claude Code CLI, which "
-            "is not on PATH. Install it from https://claude.com/claude-code (or "
-            "set ADVISOR_CLAUDE_BIN to its absolute path if it is installed but "
-            "a GUI-launched editor cannot see it), then call advisor_login "
-            "again. Without it the advisor can only use pay-per-token API "
-            "credits via ANTHROPIC_API_KEY.")
-
-    status = _cli_auth_status() or {}
-    connected = bool(status.get("loggedIn"))
-    method = status.get("authMethod")
-
-    if connected and not force:
-        if method and method != "claude.ai":
-            return (
-                f"The Claude Code CLI is logged in, but with '{method}' rather "
-                "than a claude.ai subscription — consults would bill an API "
-                "account per token, not the subscription. To switch, run "
-                "`claude auth logout` in a terminal and then call advisor_login "
-                "again (or advisor_login with force=true).\n"
-                f"Current: {_describe_account(status)}")
-        _invalidate_backend()
-        return ("Already connected — nothing to do. Consults bill the Claude "
-                f"subscription.\nCurrent: {_describe_account(status)}\n"
-                f"Active backend: {_active_backend()}")
-
-    cmd = [_claude_bin(), "auth", "login", "--claudeai"]
-    try:
-        where = _spawn_login_console(cmd)
-    except Exception as exc:
-        return ("Could not open a console for the sign-in flow on this machine "
-                f"({exc}). This is normal on a headless server, in a container, "
-                "or over plain SSH.\n\n" + prompts.MANUAL_LOGIN)
-
-    opened = (f"Opened {where} running `claude auth login --claudeai`. "
-              "Complete the sign-in in your browser, choosing the claude.ai "
-              "account whose Pro/Max subscription you want the advisor to use.")
-
-    deadline = time.time() + max(0, int(wait_seconds))
-    holder = _CANCELLATION.get()
-    while time.time() < deadline:
-        time.sleep(_LOGIN_POLL_SECONDS)
-        if holder is not None and holder.cancelled:
-            break  # the client gave up waiting; nobody reads the result
-        status = _cli_auth_status() or {}
-        if status.get("loggedIn"):
-            _invalidate_backend()
-            return (f"{opened}\n\nConnected. {_describe_account(status)}\n"
-                    f"Active backend: {_active_backend()} — consults now bill "
-                    "the Claude subscription. No restart needed.")
-
-    return (f"{opened}\n\nNot connected yet after {wait_seconds}s — the sign-in "
-            "is probably still open. Finish it in the browser, then call "
-            "advisor_login again to confirm (it will not re-open the window "
-            "once the account is connected).\n\nIf the window did not appear:\n"
-            + prompts.MANUAL_LOGIN)
 
 
 # ---------------------------------------------------------------------------
@@ -1427,12 +1270,12 @@ def register_backend(backend: Backend) -> None:
 # call time, so a replaced module attribute (tests, embedding) is honoured.
 register_backend(Backend(
     name="claude-code", provider="anthropic",
-    billing="Claude SUBSCRIPTION (Pro/Max) via the local Claude Code CLI",
-    billed_to="SUBSCRIPTION",
+    billing="your own Claude Code install, with its own sign-in",
+    billed_to="your own Claude Code sign-in",
     consult=lambda s, u, m, e, t: _consult_claude_code(s, u, m, e),
     available=lambda: bool(_claude_bin()),
     label=lambda model: "claude-code/" + _cli_model(model),
-    fallback="api", unavailable="CLI not found"))
+    unavailable="CLI not found"))
 register_backend(Backend(
     name="api", provider="anthropic",
     billing="API ACCOUNT (pay-per-token via ANTHROPIC_API_KEY)",
@@ -1619,24 +1462,7 @@ def _consult_backend(system: str, user_content: str, model: str,
         answer = _consult_cli(advisor, system, user_content, model, effort)
         return answer, _openai_footer(advisor, model or "default")
     spec = _BACKENDS[backend]
-    try:
-        answer = spec.consult(system, user_content, model, effort, max_tokens)
-    except UsageLimitError:
-        # Only "auto" may switch the payer, and only for an exhausted plan:
-        # the user asked for whatever works. An explicit backend reports the
-        # limit instead, because moving someone onto paid credits is their
-        # decision, not the server's.
-        target = _BACKENDS.get(spec.fallback or "")
-        if not (target and BACKEND == "auto" and FALLBACK_TO_API
-                and target.available()):
-            raise
-        _note_usage(backend=target.name)
-        answer = target.consult(system, user_content, model, effort, max_tokens)
-        return answer, (
-            f"\n\n---\n[advisor: {target.label_for(model)} · billed to "
-            f"{target.billed_to or target.billing} (pay-per-token) — the "
-            "Claude subscription's headless usage limit was exhausted, so this "
-            "consult fell back to API credits. Tell the user.]")
+    answer = spec.consult(system, user_content, model, effort, max_tokens)
     return answer, spec.footer(model, effort, max_tokens,
                                _resolve_max_tokens(max_tokens), LOCKED)
 
@@ -2109,9 +1935,9 @@ def _over_limit(ask: dict) -> list:
         if full:
             label, util, resets = full[0]
             problems.append(
-                f"{spec.name}: the Claude subscription's {label} window is at "
-                f"{round(util * 100)}% (resets {_clock(resets)}), so the plan "
-                "has nothing left for this request")
+                f"{spec.name}: Claude Code's {label} usage window is at "
+                f"{round(util * 100)}% (resets {_clock(resets)}), so it has "
+                "nothing left for this request")
         else:
             left_usd = _METER.plan_remaining_usd(spec.name)
             cost = usage.estimate_cost(_tier_or_id(ask["model"]), tokens_in,
@@ -2119,9 +1945,9 @@ def _over_limit(ask: dict) -> list:
             if left_usd is not None and cost is not None and cost > left_usd:
                 problems.append(
                     f"{spec.name}: this request needs ≈{_fmt_usd(cost)} of "
-                    f"API-equivalent usage, but the subscription has "
+                    f"API-equivalent usage, but Claude Code has "
                     f"≈{_fmt_usd(left_usd)} left before its tightest window "
-                    "fills (measured from the plan's own meter)")
+                    "fills (measured from its own usage meter)")
     if spec.balance == "openrouter":
         remaining = _fresh_credit(spec).get("remaining")
         cost = _spec_cost(spec, tokens_in, tokens_out)
@@ -2213,7 +2039,7 @@ def _balance_lines() -> list:
                 left = _METER.plan_remaining_usd(name)
                 status = _METER.plan_status(name)
                 lines.append(
-                    f"{name} subscription: {plan}"
+                    f"{name} via Claude Code: {plan}"
                     + (f"; ≈{_fmt_usd(left)} of API-equivalent usage left"
                        if left is not None else "")
                     + (" -- LIMIT REACHED" if status.get("status") == "rejected"
@@ -2249,8 +2075,8 @@ def _connect_advisor(name: str, provider: str, api_key: str = "",
     key = str(name or "").strip().lower()
     if key == advisors.CLAUDE:
         raise AdvisorInputError(
-            "`claude` is built in. Connect the Claude account with "
-            "advisor_login (subscription) or ANTHROPIC_API_KEY (API).")
+            "`claude` is built in: it uses ANTHROPIC_API_KEY, or the user's "
+            "own signed-in Claude Code install.")
     if not advisors.NAME.match(key):
         raise AdvisorInputError(
             f"advisor names are 1-32 lowercase letters, digits, - or _; got "
@@ -2676,7 +2502,7 @@ async def _with_heartbeat(ctx: Optional[Context], fn, *args,
 
     A consult is otherwise silent for its whole run, and MCP clients abort a
     silent tool call at their own request timeout -- shorter than a large
-    consult, and than `advisor_login`'s default wait. A progress
+    consult. A progress
     notification restarts that clock in clients that ask for progress (Kilo
     does), and is a no-op for one that sent no progress token, so the
     heartbeat runs unconditionally. When the CLI streams, the message also
@@ -2966,73 +2792,6 @@ CREDENTIAL_ANNOTATIONS = ToolAnnotations(
 )
 
 
-@tool(title="Connect a Claude subscription account",
-      annotations=CREDENTIAL_ANNOTATIONS)
-async def advisor_login(force: bool = False, wait_seconds: int = 180,
-                        ctx: Optional[Context] = None) -> str:
-    """Connect the user's Claude account so consults use their SUBSCRIPTION.
-
-    FREE — makes no model call. Opens the official Claude Code sign-in
-    (`claude auth login --claudeai`) in a console window on the user's desktop,
-    waits for them to finish in the browser, and switches the advisor onto
-    subscription billing immediately — no config edit, no server restart.
-
-    Call this when `advisor_status` reports the backend as `api` or
-    `unavailable` and the user would rather spend their Pro/Max subscription
-    than pay-per-token API credits. If the account is already connected it
-    reports that and changes nothing.
-
-    On a headless machine, in a container, or over SSH there is no desktop to
-    open a window on; the tool then returns the two manual commands instead —
-    relay them to the user verbatim.
-
-    Args:
-        force: Re-run sign-in even if an account is already connected. Use when
-            switching accounts, or when the CLI is logged in with an API key
-            (which bills the Console account rather than the subscription).
-        wait_seconds: How long to wait for the browser sign-in before returning
-            (0 skips waiting). Returning early is not a failure — call
-            advisor_login again to check.
-    """
-    # Heartbeat: the default wait outlasts a client's silence timeout.
-    return await _with_heartbeat(ctx, _login, force=force,
-                                 wait_seconds=wait_seconds,
-                                 message="Waiting for the browser sign-in")
-
-
-@tool(title="Save a Claude subscription token",
-      annotations=CREDENTIAL_ANNOTATIONS)
-async def advisor_set_token(token: str) -> str:
-    """Store a long-lived subscription token so consults bill the SUBSCRIPTION.
-
-    FREE — makes no model call. This is the headless counterpart to
-    advisor_login, and the most durable option for an MCP server started by a
-    GUI editor: the user runs `claude setup-token` once in a terminal, and you
-    pass the token it prints here. The advisor saves it to an owner-only file
-    and applies it right away — the user never has to edit their MCP client's
-    JSON config or restart the server entry.
-
-    The token is a credential: do not repeat it back to the user, log it, or
-    put it anywhere other than this argument.
-
-    Args:
-        token: The token printed by `claude setup-token`, and nothing else.
-    """
-    return await asyncio.to_thread(_set_oauth_token, token)
-
-
-@tool(title="Disconnect the stored subscription token",
-      annotations=CREDENTIAL_ANNOTATIONS)
-async def advisor_logout() -> str:
-    """Forget the subscription token the advisor has stored.
-
-    FREE — makes no model call. Removes only the advisor's own copy; the Claude
-    Code CLI's login is left alone (`claude auth logout` in a terminal signs out
-    completely). Use when switching accounts or clearing a shared machine.
-    """
-    return await asyncio.to_thread(_clear_oauth_token)
-
-
 @tool(title="Connect another advisor", annotations=CREDENTIAL_ANNOTATIONS)
 async def advisor_connect(name: str, provider: str, api_key: str = "",
                           model: str = "", base_url: str = "",
@@ -3151,8 +2910,8 @@ def advisor_usage(days: int = 7) -> str:
     FREE — makes no model call; reads the local usage ledger and the last
     balance readings. Use when the user asks how much the advisors have used
     or have left, or before a burst of consults when their limits are tight.
-    Cost is an estimate at API rates; the Claude plan's own meter appears
-    under BALANCES once a subscription consult has reported it.
+    Cost is an estimate at API rates; Claude Code's own usage meter appears
+    under BALANCES once a consult through it has reported it.
 
     Args:
         days: How far back the per-model breakdown goes (1-35).
@@ -3198,33 +2957,14 @@ def _auth_report() -> str:
                 "claude login: OK — account={} method={} plan={}".format(
                     status.get("email", "?"), status.get("authMethod", "?"),
                     status.get("subscriptionType", "?")))
-            if status.get("authMethod") not in (None, "claude.ai"):
-                lines.append(
-                    "  NOTE: authMethod is not 'claude.ai', so CLI consults may "
-                    "bill an API account rather than the subscription. Call "
-                    "`advisor_login` with force=true to switch to a "
-                    "subscription account.")
         else:
-            lines.append("claude login: NOT LOGGED IN — call the `advisor_login` "
-                         "tool to connect the user's subscription account "
-                         "(opens the sign-in on their desktop), or have them run "
-                         "`claude setup-token` and pass it to `advisor_set_token`.")
+            lines.append("claude login: not signed in. To use this install, the "
+                         "user runs `claude` in a terminal and signs in.")
     else:
         lines.append("claude CLI: NOT FOUND on PATH — install Claude Code, or set "
                      "ADVISOR_CLAUDE_BIN to its absolute path (GUI editors often "
                      "have a reduced PATH).")
 
-    token_source = ("environment" if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-                    else "stored by advisor_set_token"
-                    if _read_credentials().get("claude_code_oauth_token")
-                    else None)
-    if token_source:
-        lines.append(f"subscription token: present ({token_source}) — durable "
-                     "headless auth, good.")
-    else:
-        lines.append("subscription token: none stored. `advisor_login` (or "
-                     "`advisor_set_token`) makes subscription auth survive "
-                     "restarts and reduced GUI environments.")
     lines.append("api key: " + ("present" if os.environ.get("ANTHROPIC_API_KEY")
                                 else "absent"))
 
@@ -3232,19 +2972,14 @@ def _auth_report() -> str:
         if os.environ.get(var):
             kept = os.environ.get("ADVISOR_KEEP_AUTH_ENV") == "1"
             lines.append(
-                f"note: {var} is present in the server env; it would hijack "
-                "billing away from the subscription, so it is "
-                + ("KEPT (ADVISOR_KEEP_AUTH_ENV=1)." if kept
-                   else "stripped from claude subprocesses."))
+                f"note: {var} is present in the server env, so it is "
+                + ("KEPT for claude subprocesses (ADVISOR_KEEP_AUTH_ENV=1)."
+                   if kept else "stripped from claude subprocesses (they use "
+                   "the install's own sign-in)."))
 
     if backend == "unavailable":
         lines.append("")
         lines.append(prompts.NO_CREDENTIALS)
-    elif backend == "api":
-        lines.append("")
-        lines.append("This is billing pay-per-token API credits. If the user has "
-                     "a Claude Pro/Max subscription, call `advisor_login` to "
-                     "switch to it at no per-token cost.")
     return "\n".join(lines)
 
 
@@ -3283,8 +3018,8 @@ def _advisor_status_lines() -> list:
                      "can ask them the same question, or each its own.")
     balances = _balance_lines()
     lines.append("balances:" + ("" if balances else " none reported yet (the "
-                                "Claude plan meter appears after a "
-                                "subscription consult)"))
+                                "Claude Code meter appears after a consult "
+                                "through it)"))
     lines += ["  " + line for line in balances]
     return lines
 
@@ -3292,10 +3027,8 @@ def _advisor_status_lines() -> list:
 def _status_report() -> str:
     backend = _active_backend()
     billing = {
-        "claude-code": "Claude SUBSCRIPTION (Pro/Max) via the local Claude Code "
-                       "CLI; ANTHROPIC_API_KEY is stripped from the subprocess",
-        "api": "DEVELOPER API account (pay-per-token via ANTHROPIC_API_KEY) — "
-               "NOT the Pro/Max subscription",
+        "claude-code": "your own Claude Code install, with its own sign-in",
+        "api": "Anthropic API (pay-per-token via ANTHROPIC_API_KEY)",
         "unavailable": "NONE — no usable credentials; run advisor_auth_check",
     }.get(backend) or (_BACKENDS[backend].billing if backend in _BACKENDS
                        else backend)
@@ -3351,15 +3084,7 @@ def _status_report() -> str:
             f" on {HTTP_HOST}:{HTTP_PORT}, " + (
                 "bearer token required" if HTTP_TOKEN else "no authentication")
             if TRANSPORT == "http" else ""),
-        "subscription token: " + (
-            "set in the environment" if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-            else "stored by advisor_set_token"
-            if _read_credentials().get("claude_code_oauth_token")
-            else "none (the CLI's own login is used, if any)"),
     ]
-    if BACKEND == "auto":
-        lines.append("usage-limit fallback to API credits: "
-                     + ("enabled" if FALLBACK_TO_API else "disabled"))
     if MAX_BUDGET_USD:
         lines.append(f"per-consult budget cap: ${MAX_BUDGET_USD}")
     return "\n".join(lines)
@@ -3369,19 +3094,17 @@ def _billing_banner() -> str:
     backend = _active_backend()
     if backend == "claude-code":
         return (f"[wisdomtooth v{__version__}] backend={backend} → consults run "
-                "through the local Claude Code CLI and bill your Claude "
-                "SUBSCRIPTION (Pro/Max). ANTHROPIC_API_KEY is stripped from the "
-                "subprocess so it cannot silently switch to API billing.")
+                "through your own Claude Code install, with its own sign-in.")
     if backend == "api":
         return (f"[wisdomtooth v{__version__}] backend={backend} → consults use "
-                "ANTHROPIC_API_KEY and bill your DEVELOPER CONSOLE account per "
-                "token (NOT your Pro/Max subscription).")
+                "ANTHROPIC_API_KEY and bill your Anthropic API account per "
+                "token.")
     if backend in _BACKENDS:
         return (f"[wisdomtooth v{__version__}] backend={backend} → "
                 + _BACKENDS[backend].billing)
     return (f"[wisdomtooth v{__version__}] no usable credentials — every "
-            "consult will fail until you log in Claude Code (`claude` → "
-            "`/login`) or set ANTHROPIC_API_KEY. Run advisor_auth_check.")
+            "consult will fail until you set ANTHROPIC_API_KEY, or sign in to "
+            "Claude Code by running `claude`. Run advisor_auth_check.")
 
 
 def _announce() -> None:

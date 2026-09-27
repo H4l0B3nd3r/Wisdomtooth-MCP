@@ -100,7 +100,7 @@ def test_saving_can_be_turned_off(server, fake_claude, consult_dir):
     assert not consult_dir.exists()
     assert "[saved:" not in answer
     # The billing footer is untouched by the switch.
-    assert "billed to SUBSCRIPTION" in answer
+    assert "billed to your own Claude Code sign-in" in answer
 
 
 def test_a_failed_write_costs_the_transcript_not_the_answer(server, fake_claude,
