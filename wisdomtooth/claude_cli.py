@@ -43,8 +43,8 @@ class Cancellation:
     """Lets the async tool wrapper stop a consult running in a worker thread.
 
     `asyncio.to_thread` cannot interrupt its thread, so a client that gave up
-    on a consult used to leave `claude` running -- and spending quota -- until
-    it finished or timed out. The wrapper puts one of these in a context
+    on a consult would otherwise leave `claude` running -- and spending quota --
+    until it finished or timed out. The wrapper puts one of these in a context
     variable, which `to_thread` copies into the worker; the runners register
     each process they start, and `cancel` kills it. A streaming runner also
     hangs its `StreamState` here, so the heartbeat can say what Claude is doing.
@@ -102,11 +102,42 @@ CANCELLED = ("The consult was cancelled by the client, and the claude process "
              "was stopped.")
 
 
-def wrap_for_windows(cmd: list) -> list:
+def _cmd_quote(arg: str) -> str:
+    """One argument for a cmd.exe command line, always in double quotes.
+
+    Inside quotes cmd.exe takes `&`, `|`, `<`, `>`, `^` and spaces literally,
+    and backslashes follow the rules the CLI's own argv parser applies.
+    cmd.exe still expands `%VAR%`, and an embedded `"` ends its quoting, so
+    text the caller controls must not reach here unchecked -- the server
+    validates the model name, and every other argument is its own.
+    """
+    out, backslashes = ['"'], 0
+    for ch in arg:
+        if ch == "\\":
+            backslashes += 1
+            continue
+        if ch == '"':
+            out.append("\\" * (backslashes * 2 + 1) + '"')
+        else:
+            out.append("\\" * backslashes + ch)
+        backslashes = 0
+    out.append("\\" * (backslashes * 2) + '"')
+    return "".join(out)
+
+
+def wrap_for_windows(cmd: list):
     """npm-installed Claude Code resolves to claude.cmd/.bat, which
-    CreateProcess cannot exec directly -- route those through cmd /c."""
+    CreateProcess cannot exec directly, so those run through cmd.exe.
+
+    The command line is built by hand: with `/s`, cmd.exe removes exactly the
+    outer pair of quotes and keeps the rest, so every argument can be quoted.
+    A list would go through `list2cmdline`, which leaves `&` unquoted and whose
+    quoting cmd.exe mangles once the shim's path contains a space.
+    """
     if os.name == "nt" and cmd and cmd[0].lower().endswith((".cmd", ".bat")):
-        return ["cmd", "/c"] + cmd
+        shell = os.environ.get("COMSPEC") or "cmd.exe"
+        line = " ".join(_cmd_quote(str(arg)) for arg in cmd)
+        return f'"{shell}" /d /s /c "{line}"'
     return cmd
 
 

@@ -45,6 +45,7 @@ import inspect
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -73,11 +74,8 @@ from . import (accounts, advisors, claude_cli, config, doctor, httpauth, models,
 from .backends import Backend
 from .claude_cli import CANCELLATION as _CANCELLATION
 from .claude_cli import Cancellation as _Cancellation
-from .claude_cli import kill_tree as _kill_tree  # noqa: F401 - re-exported
-from .claude_cli import parse_output as _parse_cli_output
 from .claude_cli import spawn_login_console as _spawn_login_console
-from .claude_cli import wrap_for_windows as _wrap_for_windows  # noqa: F401
-from .config import CONFIG_KEYS, PRESETS, DEFAULT_PRESET  # noqa: F401
+from .config import CONFIG_KEYS
 from .errors import (AdvisorError, AdvisorInputError, OverLimitError,
                      UsageLimitError)
 from .models import (CLAUDE_CODE_ALIASES, FALLBACK_BETA, MAX_TOKENS_CEILING,
@@ -252,7 +250,6 @@ def _resolve_max_tokens(max_tokens: int = 0) -> int:
     return max(1, min(int(max_tokens), MAX_TOKENS_CEILING))
 
 
-_caps = models.caps
 _supports_fallbacks = models.supports_fallbacks
 
 
@@ -296,11 +293,9 @@ def _build_system_prompt() -> str:
     return prompt
 
 
-BUILTIN_SYSTEM_PROMPT = prompts.BUILTIN_SYSTEM_PROMPT
 ADVISOR_SYSTEM_PROMPT = _build_system_prompt()
-WHEN_TO_USE = prompts.WHEN_TO_USE
 
-_server_kwargs = dict(name="wisdomtooth", instructions=WHEN_TO_USE)
+_server_kwargs = dict(name="wisdomtooth", instructions=prompts.WHEN_TO_USE)
 if _MCP_MAJOR >= 2:
     _server_kwargs["version"] = __version__
 else:
@@ -334,7 +329,7 @@ def tool(title: str, annotations: ToolAnnotations):
 
     A plain `def` is registered through an async wrapper that runs it in a
     worker thread. mcp 1.x calls a sync tool on the event loop itself, so a
-    status call that probes a slow CLI used to freeze every other request,
+    status call that probes a slow CLI would freeze every other request,
     heartbeats included. The module keeps the original function.
     """
     def decorate(fn):
@@ -458,7 +453,6 @@ def _clear_oauth_token() -> str:
 # Outbound-content safety
 # ---------------------------------------------------------------------------
 
-SECRET_PATTERNS = safety.SECRET_PATTERNS
 _NSFW_MAP = safety.load_nsfw_map(os.environ.get("ADVISOR_NSFW_EXTRA_JSON"))
 _NSFW_RE = safety.compile_words(_NSFW_MAP)
 
@@ -570,7 +564,6 @@ def _read_context_files(paths) -> str:
 # pastes the old exchange nor pays for it in its own context.
 
 CONSULT_SUFFIX = transcripts.SUFFIX
-_slug = transcripts.slug
 
 
 def _consult_dir() -> str:
@@ -687,12 +680,8 @@ _USAGE: "contextvars.ContextVar[Optional[dict]]" = contextvars.ContextVar(
 
 _SESSION_RECORDS: list = []  # this process's records, used when the ledger is off
 _LEDGER_LOCK = threading.Lock()
-_usage_record = usage.usage_record
-_billed = usage.billed
 _fmt_usd = usage.fmt_usd
-_fmt_tokens = usage.fmt_tokens
 _summarise = usage.summarise
-_usage_footer = usage.usage_footer
 
 
 def _note_usage(**fields) -> None:
@@ -802,7 +791,7 @@ def _usage_report(days: int = 7) -> str:
         s = _summarise(rows)
         sections.append(
             f"  {name:<22} {s['consults']:>4} consults  "
-            f"{_fmt_tokens(s['input'])} in / {_fmt_tokens(s['output'])} out"
+            f"{usage.fmt_tokens(s['input'])} in / {usage.fmt_tokens(s['output'])} out"
             + (f"  ≈{_fmt_usd(s['cost'])}" if s["cost"] is not None else ""))
     balances = _balance_lines()
     sections += ["", "BALANCES:"] + (["  " + b for b in balances] or [
@@ -864,8 +853,7 @@ def _support_line() -> str:
 # ---------------------------------------------------------------------------
 
 def _claude_bin() -> Optional[str]:
-    import shutil
-    return os.environ.get("ADVISOR_CLAUDE_BIN") or shutil.which("claude")
+    return _setting("claude_bin") or shutil.which("claude")
 
 
 def _run_claude(cmd, env=None, workdir=None, timeout_s=60, stdin_text="",
@@ -977,12 +965,15 @@ def _workdir() -> str:
     return path
 
 
+# What `--model` may carry. On Windows an npm-installed CLI runs through
+# cmd.exe, so a model name is kept to characters that are never shell syntax.
+_CLI_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]*$")
+
 _AUTH_SIGNATURES = ("/login", "not logged in", "invalid api key", "authentication",
                     "oauth", "token expired", "credential", "unauthorized",
                     "please log in")
 _LIMIT_SIGNATURES = ("usage limit", "rate limit", "quota", "limit reached",
                      "upgrade to", "resets at")
-_AUTH_HELP = prompts.AUTH_HELP
 
 
 def _stderr_tail(exc) -> str:
@@ -1010,8 +1001,13 @@ def _consult_claude_code(system: str, user_content: str, model: str,
             "ANTHROPIC_API_KEY."
         )
 
+    cli_model = _cli_model(model)
+    if not _CLI_MODEL.match(cli_model):
+        raise AdvisorInputError(
+            f"{model!r} is not a model name. Use a tier (fast, balanced, "
+            "deep) or a model ID such as 'claude-sonnet-5'.")
     features = _cli_features(claude_bin)
-    cmd = [claude_bin, "-p", "--model", _cli_model(model)]
+    cmd = [claude_bin, "-p", "--model", cli_model]
 
     def add(flag, value=None):
         if flag in features:
@@ -1095,7 +1091,7 @@ def _consult_claude_code(system: str, user_content: str, model: str,
 
     blob = ((result.stderr or "") + " " + (result.stdout or "")).lower()
 
-    answer, payload = _parse_cli_output(result.stdout or "")
+    answer, payload = claude_cli.parse_output(result.stdout or "")
     if payload:
         # Before the failure checks: a failed run can still have been billed.
         _note_usage(**_cli_usage(payload, model))
@@ -1127,7 +1123,7 @@ def _consult_claude_code(system: str, user_content: str, model: str,
                 "whether to wait for the reset or spend API credits. CLI said: "
                 + detail)
         if any(sig in blob for sig in _AUTH_SIGNATURES):
-            raise AdvisorError(_AUTH_HELP + detail)
+            raise AdvisorError(prompts.AUTH_HELP + detail)
         raise AdvisorError(
             f"claude CLI failed (exit {result.returncode}). " + detail)
 
@@ -1168,6 +1164,35 @@ def _stream(messages_api, **kwargs):
         return stream.get_final_message()
 
 
+def _api_failure(exc: "anthropic.APIError") -> AdvisorError:
+    """The message the agent sees for a failed API request."""
+    name = exc.__class__.__name__
+    if isinstance(exc, anthropic.AuthenticationError):
+        return AdvisorError(
+            "AUTH FAILURE on the API backend: ANTHROPIC_API_KEY is missing, "
+            "invalid, or revoked. Verify it at console.anthropic.com and set "
+            "it in the MCP server config env, then restart the server entry. "
+            "If the user intended SUBSCRIPTION billing, use "
+            "ADVISOR_BACKEND=claude-code (no API key needed). Do not retry "
+            f"until fixed. ({name})")
+    if isinstance(exc, anthropic.RateLimitError):
+        return AdvisorError(
+            f"The Anthropic API is rate-limiting this account ({name}: {exc}). "
+            "Retry at most once, after a pause; if it persists, tell the user.")
+    if isinstance(exc, anthropic.APIConnectionError):
+        return AdvisorError(
+            f"Could not reach the Anthropic API ({name}: {exc}). Check the "
+            "network or proxy. Retry at most once, then tell the user.")
+    if (isinstance(exc, anthropic.InternalServerError)
+            or (getattr(exc, "status_code", 0) or 0) >= 500):
+        return AdvisorError(
+            f"The Anthropic API failed on its side ({name}: {exc}), usually "
+            "because it is overloaded. Retry at most once, after a pause, then "
+            "tell the user.")
+    return AdvisorError(f"The Anthropic API refused the request ({name}: "
+                        f"{exc}). Do not retry it unchanged.")
+
+
 def _consult_api(system: str, user_content: str, model: str,
                  effort: Optional[str], max_tokens: int = 0) -> str:
     if not _api_credentials_present():
@@ -1185,35 +1210,31 @@ def _consult_api(system: str, user_content: str, model: str,
     api = client()
 
     message = None
-    if _supports_fallbacks(model):
-        # A refused consult should be rescued on another model rather than
-        # returning nothing. Degrade quietly if the installed SDK is older than
-        # the parameter, or the account/platform does not offer it.
-        try:
-            message = _stream(api.beta.messages, system=system, messages=messages,
-                              betas=[FALLBACK_BETA], fallbacks="default", **kwargs)
-        except (TypeError, anthropic.BadRequestError, anthropic.NotFoundError,
-                anthropic.PermissionDeniedError):
-            message = None
-
-    if message is None:
-        try:
-            message = _stream(api.messages, system=system, messages=messages,
-                              **kwargs)
-        except anthropic.AuthenticationError as exc:
-            raise AdvisorError(
-                "AUTH FAILURE on the API backend: ANTHROPIC_API_KEY is missing, "
-                "invalid, or revoked. Verify it at console.anthropic.com and set "
-                "it in the MCP server config env, then restart the server entry. "
-                "If the user intended SUBSCRIPTION billing, use "
-                "ADVISOR_BACKEND=claude-code (no API key needed). Do not retry "
-                f"until fixed. ({exc.__class__.__name__})") from exc
-        except anthropic.BadRequestError:
-            # Capability drift (new or renamed models): retry as a plain request.
-            kwargs.pop("output_config", None)
-            kwargs.pop("thinking", None)
-            message = _stream(api.messages, system=system, messages=messages,
-                              **kwargs)
+    try:
+        if _supports_fallbacks(model):
+            # A refused consult should be rescued on another model rather than
+            # returning nothing. Degrade quietly if the installed SDK is older
+            # than the parameter, or the account/platform does not offer it.
+            try:
+                message = _stream(api.beta.messages, system=system,
+                                  messages=messages, betas=[FALLBACK_BETA],
+                                  fallbacks="default", **kwargs)
+            except (TypeError, anthropic.BadRequestError,
+                    anthropic.NotFoundError, anthropic.PermissionDeniedError):
+                message = None
+        if message is None:
+            try:
+                message = _stream(api.messages, system=system,
+                                  messages=messages, **kwargs)
+            except anthropic.BadRequestError:
+                # Capability drift (new or renamed models): retry as a plain
+                # request.
+                kwargs.pop("output_config", None)
+                kwargs.pop("thinking", None)
+                message = _stream(api.messages, system=system,
+                                  messages=messages, **kwargs)
+    except anthropic.APIError as exc:
+        raise _api_failure(exc) from exc
 
     _note_usage(**_api_usage(message, model))
     if getattr(message, "stop_reason", None) == "refusal":
@@ -1276,16 +1297,20 @@ def _active_backend() -> str:
     if BACKEND in _BACKENDS:
         return BACKEND  # an explicit choice is never second-guessed
     with _BACKEND_LOCK:
-        if _ACTIVE_BACKEND is None:
-            status = _cli_auth_status()
-            if (status and status.get("loggedIn")) or (_oauth_token()
-                                                       and _claude_bin()):
-                _ACTIVE_BACKEND = "claude-code"
-            elif _api_credentials_present():
-                _ACTIVE_BACKEND = "api"
-            else:
-                _ACTIVE_BACKEND = "unavailable"
-        return _ACTIVE_BACKEND
+        if _ACTIVE_BACKEND is not None:
+            return _ACTIVE_BACKEND
+        status = _cli_auth_status()
+        if (status and status.get("loggedIn")) or (_oauth_token()
+                                                   and _claude_bin()):
+            resolved = "claude-code"
+        elif _api_credentials_present():
+            resolved = "api"
+        else:
+            # Not cached: a user who signs in or sets a key after the server
+            # started should not have to restart it.
+            return "unavailable"
+        _ACTIVE_BACKEND = resolved
+        return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -1295,8 +1320,6 @@ def _active_backend() -> str:
 # Seconds between "is the browser sign-in done yet?" checks. A module constant
 # so tests can drive the poll loop without patching the stdlib.
 _LOGIN_POLL_SECONDS = 3.0
-_MANUAL_LOGIN = prompts.MANUAL_LOGIN
-_NO_CREDENTIALS = prompts.NO_CREDENTIALS
 
 
 def _describe_account(status: dict) -> str:
@@ -1340,7 +1363,7 @@ def _login(force: bool = False, wait_seconds: int = 180) -> str:
     except Exception as exc:
         return ("Could not open a console for the sign-in flow on this machine "
                 f"({exc}). This is normal on a headless server, in a container, "
-                "or over plain SSH.\n\n" + _MANUAL_LOGIN)
+                "or over plain SSH.\n\n" + prompts.MANUAL_LOGIN)
 
     opened = (f"Opened {where} running `claude auth login --claudeai`. "
               "Complete the sign-in in your browser, choosing the claude.ai "
@@ -1363,7 +1386,7 @@ def _login(force: bool = False, wait_seconds: int = 180) -> str:
             "is probably still open. Finish it in the browser, then call "
             "advisor_login again to confirm (it will not re-open the window "
             "once the account is connected).\n\nIf the window did not appear:\n"
-            + _MANUAL_LOGIN)
+            + prompts.MANUAL_LOGIN)
 
 
 # ---------------------------------------------------------------------------
@@ -1432,7 +1455,7 @@ def _route(spec, model: str, effort: str) -> tuple:
     if spec.kind == "claude":
         backend = _active_backend()
         if backend == "unavailable":
-            raise AdvisorError(_NO_CREDENTIALS)
+            raise AdvisorError(prompts.NO_CREDENTIALS)
         return _resolve_model(model), _resolve_effort(effort), backend
     ready, why = _advisor_ready(spec.name)
     if not ready:
@@ -1479,7 +1502,7 @@ def _consult(question: str, context: str = "", extra_system: str = "",
                       system, user_content)
     hit = _recall(key)
     if hit:
-        _append_usage(_usage_record(kind, backend, model, effort, "repeat",
+        _append_usage(usage.usage_record(kind, backend, model, effort, "repeat",
                                     user_content, transcript=hit["path"],
                                     advisor=spec.name))
         if saved is not None:
@@ -1497,7 +1520,7 @@ def _consult(question: str, context: str = "", extra_system: str = "",
                             system=system, user_content=user_content)],
                       confirm_over_limit, kind)
 
-    record = _usage_record(kind, backend, model, effort, "ok", user_content,
+    record = usage.usage_record(kind, backend, model, effort, "ok", user_content,
                            advisor=spec.name)
     token = _USAGE.set(record)
     started = time.monotonic()
@@ -1515,7 +1538,7 @@ def _consult(question: str, context: str = "", extra_system: str = "",
     _note_plan(spec, record)
     record.update(duration_s=round(time.monotonic() - started, 1),
                   answer_chars=len(answer))
-    footer += _usage_footer(record)
+    footer += usage.usage_footer(record)
     footer += _balance_footer(spec, record, confirm_over_limit)
 
     # The transcript keeps the whole answer; the caller may get only its lead.
@@ -1891,7 +1914,7 @@ def _record_tokens(record: dict) -> int:
 def _allowance_used(spec, now: Optional[float] = None) -> int:
     now = time.time() if now is None else now
     since = now - spec.allowance_seconds
-    return sum(_record_tokens(r) for r in _billed(_usage_records(since))
+    return sum(_record_tokens(r) for r in usage.billed(_usage_records(since))
                if (r.get("advisor") or advisors.CLAUDE) == spec.name)
 
 
@@ -1975,7 +1998,7 @@ def _hold_if_over(asks: list, confirmed: bool, kind: str) -> None:
     if not problems or confirmed:
         return
     for ask in asks:
-        _append_usage(_usage_record(kind, ask["backend"], ask["model"],
+        _append_usage(usage.usage_record(kind, ask["backend"], ask["model"],
                                     ask["effort"], "held", ask["user_content"],
                                     advisor=ask["spec"].name))
     raise OverLimitError(
@@ -3039,7 +3062,7 @@ def _auth_report() -> str:
 
     if backend == "unavailable":
         lines.append("")
-        lines.append(_NO_CREDENTIALS)
+        lines.append(prompts.NO_CREDENTIALS)
     elif backend == "api":
         lines.append("")
         lines.append("This is billing pay-per-token API credits. If the user has "

@@ -5,6 +5,7 @@ spend -- and asserts on the exact argv, stdin, and environment the server hands
 to the child process.
 """
 
+import json
 import os
 
 import pytest
@@ -358,3 +359,57 @@ def test_inline_system_prompt_is_used_when_the_file_flag_is_absent(
     srv = server(ADVISOR_BACKEND="claude-code")
     consult(srv)
     assert "--system-prompt" in fake_claude.last["argv"]
+
+
+# --------------------------------------------------------------------------
+# Paths and arguments that reach a shell
+# --------------------------------------------------------------------------
+
+def test_consults_work_when_paths_contain_spaces(server, fake_claude, tmp_path,
+                                                 monkeypatch):
+    """A Windows user named "Jane Doe" has spaces in the npm shim's path and in
+    the system-prompt file's path. cmd.exe mangles such a command line unless
+    it is quoted as a whole."""
+    spaced = tmp_path / "dir with space"
+    spaced.mkdir()
+    launcher = spaced / fake_claude.path.name
+    launcher.write_bytes(fake_claude.path.read_bytes())
+    if os.name != "nt":
+        launcher.chmod(0o755)
+    monkeypatch.setenv("ADVISOR_CLAUDE_BIN", str(launcher))
+    srv = server(ADVISOR_BACKEND="claude-code")
+    monkeypatch.setattr(srv, "_state_dir", lambda: str(spaced / "state"))
+    assert "FAKE ANSWER" in consult(srv)
+    argv = fake_claude.last["argv"]
+    assert argv[argv.index("--tools") + 1] == ""
+    assert "dir with space" in fake_claude.flag_value("--system-prompt-file")
+
+
+@pytest.mark.parametrize("model", ["sonnet&echo INJECTED", "opus|calc",
+                                   "haiku>out.txt", "a b", "%PATH%"])
+def test_a_model_name_that_could_reach_a_shell_is_refused(server, fake_claude,
+                                                          model):
+    """On Windows an npm-installed CLI runs through cmd.exe, where `&`, `|`,
+    `>` and `%` in an argument are commands, not text."""
+    srv = server(ADVISOR_BACKEND="claude-code")
+    with pytest.raises(ValueError):
+        consult(srv, model=model)
+    assert not any(c["prompt"] for c in fake_claude.calls())
+
+
+@pytest.mark.parametrize("model", ["claude-opus-4-6[1m]", "claude-sonnet-5",
+                                   "opus", "us.anthropic.claude-opus-5-v1:0"])
+def test_real_model_ids_are_accepted(server, fake_claude, model):
+    srv = server(ADVISOR_BACKEND="claude-code")
+    assert "FAKE ANSWER" in consult(srv, model=model)
+
+
+def test_the_config_file_can_name_the_cli(server, fake_claude, tmp_path,
+                                          monkeypatch):
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"claude_bin": str(fake_claude.path)}),
+                      encoding="utf-8")
+    monkeypatch.delenv("ADVISOR_CLAUDE_BIN")
+    monkeypatch.setattr("shutil.which", lambda *a, **k: None)
+    srv = server(ADVISOR_BACKEND="claude-code", ADVISOR_CONFIG=str(config))
+    assert srv._claude_bin() == str(fake_claude.path)

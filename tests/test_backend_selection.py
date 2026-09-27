@@ -122,3 +122,13 @@ def test_auth_failure_does_not_trigger_a_billing_fallback(
                         lambda *a, **k: pytest.fail("must not reach the API"))
     with pytest.raises(RuntimeError):
         srv._consult(question="q")
+
+
+def test_auto_notices_credentials_that_appear_after_startup(
+        server, no_claude, monkeypatch):
+    """A user who signs in, or sets a key, after the server started must not
+    need a restart: "unavailable" is not cached."""
+    srv = server(ADVISOR_BACKEND="auto")
+    assert srv._active_backend() == "unavailable"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-added-later")
+    assert srv._active_backend() == "api"

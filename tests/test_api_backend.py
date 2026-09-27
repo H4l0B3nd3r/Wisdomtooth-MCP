@@ -192,3 +192,34 @@ def test_empty_response_is_explained_not_returned_blank(api):
     srv, _ = api(message=FakeMessage(text="", stop_reason="max_tokens"))
     answer = srv._consult(question="q")
     assert "max_tokens" in answer or "ADVISOR_MAX_TOKENS" in answer
+
+
+def _api_error(cls, message="boom"):
+    err = cls.__new__(cls)
+    Exception.__init__(err, message)
+    return err
+
+
+@pytest.mark.parametrize("cls, expect", [
+    (anthropic.RateLimitError, "rate"),
+    (anthropic.InternalServerError, "retry"),
+    (anthropic.APIConnectionError, "reach"),
+    (anthropic.APITimeoutError, "reach"),
+])
+def test_api_failures_arrive_as_advisor_errors(api, cls, expect):
+    """A raw SDK exception reaches the agent as a bare "Error executing tool";
+    each failure the agent can act on gets its own message."""
+    srv, _ = api(raises=_api_error(cls))
+    with pytest.raises(srv.AdvisorError) as exc:
+        srv._consult(question="q", model="balanced")
+    assert expect in str(exc.value).lower()
+
+
+def test_a_bad_key_is_explained_on_the_fallbacks_path_too(api):
+    """`deep` goes through the beta endpoint first; a rejected key there must
+    get the same AUTH FAILURE message as on the plain endpoint."""
+    err = _api_error(anthropic.AuthenticationError)
+    srv, _ = api(beta_raises=err)
+    with pytest.raises(srv.AdvisorError) as exc:
+        srv._consult(question="q", model="deep")
+    assert "AUTH FAILURE" in str(exc.value)
