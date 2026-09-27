@@ -69,8 +69,9 @@ except ImportError:  # mcp 1.x
 
 from mcp.types import ToolAnnotations
 
-from . import (accounts, advisors, claude_cli, config, doctor, httpauth, models,
-               openai_compat, prompts, safety, storage, transcripts, usage)
+from . import (accounts, advisors, claude_cli, cli_advisors, config, doctor,
+               httpauth, models, openai_compat, prompts, safety, storage,
+               transcripts, usage)
 from .backends import Backend
 from .claude_cli import CANCELLATION as _CANCELLATION
 from .claude_cli import Cancellation as _Cancellation
@@ -941,6 +942,7 @@ def _child_env() -> dict:
     hijack = () if os.environ.get("ADVISOR_KEEP_AUTH_ENV") == "1" else (
         "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
     env = {k: v for k, v in os.environ.items() if k not in hijack}
+    env[cli_advisors.NESTED_ENV] = "1"
     # Inject the stored subscription token: a GUI-launched MCP client hands us
     # a reduced environment, so inheriting it is not enough.
     token = _oauth_token()
@@ -1491,6 +1493,22 @@ def _note_plan(spec, record: dict) -> None:
         _METER.note_plan(spec.name, info, record.get("cost_usd"))
 
 
+def _refuse_if_nested() -> None:
+    """Refuse to consult from a server an advisor's own CLI started.
+
+    Kilo, Qwen Code and others load the user's MCP servers, this one
+    included. An advisor that called ask_wisdomtooth would ask the advisor
+    again, without end; the CLI advisors run with NESTED_ENV set, and a server
+    that inherits it answers nothing.
+    """
+    if os.environ.get(cli_advisors.NESTED_ENV):
+        raise AdvisorError(
+            "This Wisdomtooth server was started by an advisor's own CLI (it "
+            f"inherited {cli_advisors.NESTED_ENV}), so it refuses to consult: "
+            "the advisor would be asking itself, in a loop. Answer from what "
+            "you have.")
+
+
 def _consult(question: str, context: str = "", extra_system: str = "",
              model: str = "", effort: str = "", max_tokens: int = 0,
              scrub_context: bool = True, kind: str = "consult",
@@ -1512,6 +1530,7 @@ def _consult(question: str, context: str = "", extra_system: str = "",
     (OverLimitError) unless `confirm_over_limit`; `held_already` says a
     multi-advisor caller has checked every account at once.
     """
+    _refuse_if_nested()
     spec = _advisor_spec(advisor)
     system, question, user_content = _prepare(question, context, extra_system,
                                               scrub_context, context_files,
@@ -1596,6 +1615,9 @@ def _consult_backend(system: str, user_content: str, model: str,
         answer = _consult_openai(advisor, system, user_content, model, effort,
                                  max_tokens)
         return answer, _openai_footer(advisor, model)
+    if advisor is not None and advisor.kind == "cli":
+        answer = _consult_cli(advisor, system, user_content, model, effort)
+        return answer, _openai_footer(advisor, model or "default")
     spec = _BACKENDS[backend]
     try:
         answer = spec.consult(system, user_content, model, effort, max_tokens)
@@ -1687,9 +1709,9 @@ def _advisor_spec(name: str = "") -> advisors.AdvisorSpec:
     if spec is None:
         raise AdvisorInputError(
             f"no advisor named {name!r}. Connected: {_advisor_choices()}. To "
-            "add one, the user can call advisor_connect (provider openai, "
-            "gemini, openrouter, lmstudio, ollama or openai-compatible) or "
-            "add it to the config file's `advisors`.")
+            "add one, the user can call advisor_connect (provider "
+            f"{', '.join(advisors.ALL_PROVIDERS)}) or add it to the config "
+            "file's `advisors`.")
     return spec
 
 
@@ -1704,6 +1726,12 @@ def _advisor_ready(name: str) -> tuple:
         if _active_backend() == "unavailable":
             return False, "no usable Claude credentials (run advisor_auth_check)"
         return True, "ready"
+    if spec.kind == "cli":
+        if _cli_path(spec):
+            return True, "ready"
+        preset = cli_advisors.PRESETS[spec.provider]
+        return False, (f"{spec.label} is not installed here ({spec.command} is "
+                       f"not on PATH): {preset.setup}")
     if spec.needs_key and not _advisor_key(spec):
         where = (f"set {spec.api_key_env} in the MCP server env, or "
                  if spec.api_key_env else "")
@@ -1727,7 +1755,17 @@ def _advisor_effort(spec: advisors.AdvisorSpec,
     return advisors.effort_for(spec, effort)
 
 
+def _cli_path(spec: advisors.AdvisorSpec) -> Optional[str]:
+    """The CLI advisor's executable, or None if it is not installed."""
+    command = os.path.expanduser(spec.command)
+    if os.path.dirname(command):
+        return command if os.path.isfile(command) else None
+    return shutil.which(command)
+
+
 def _short_billing(spec: advisors.AdvisorSpec) -> str:
+    if spec.kind == "cli":
+        return spec.billing
     if spec.local:
         return "LOCAL MODEL (no per-token cost)"
     return {"openai": "OPENAI API ACCOUNT", "gemini": "GEMINI API ACCOUNT",
@@ -1846,6 +1884,75 @@ def _consult_openai(spec: advisors.AdvisorSpec, system: str, user_content: str,
                     "then retry ONCE.]")
         raise AdvisorError(f"{who} returned an empty answer (finish reason: "
                            f"{result.finish_reason or 'none'}).")
+    return answer
+
+
+def _consult_cli(spec: advisors.AdvisorSpec, system: str, user_content: str,
+                 model: str, effort: Optional[str]) -> str:
+    """One consult on a vendor CLI the user installed; see cli_advisors."""
+    preset = cli_advisors.PRESETS[spec.provider]
+    who = f"advisor {spec.name!r} ({spec.label})"
+    path = _cli_path(spec)
+    if not path:
+        raise AdvisorError(f"{who} is not installed here: {spec.command} is not "
+                           f"on PATH. To use it, {preset.setup}. Nothing was "
+                           "sent.")
+    if model and not cli_advisors.MODEL_NAME.match(model):
+        raise AdvisorInputError(f"{model!r} is not a model name. Use a tier "
+                                "(fast, balanced, deep) or the CLI's model ID.")
+    sent_effort = cli_advisors.clamp_effort(preset, effort)
+    _note_usage(sent_effort=sent_effort)
+    cmd = [path] + preset.argv(model, sent_effort) + list(spec.args)
+    text = preset.frame(cli_advisors.stdin_text(system, user_content))
+    reader = preset.reader()
+    timeout_s = _consult_timeout(len(text), effort)
+    env = dict(os.environ)
+    env[cli_advisors.NESTED_ENV] = "1"
+    try:
+        result = claude_cli.run_streaming(cmd, env, _workdir(), timeout_s, text,
+                                          idle_s=IDLE_TIMEOUT, state=reader)
+    except claude_cli.IdleTimeout as exc:
+        raise AdvisorError(
+            f"{who} went silent: no output for {exc.idle_s:g}s, {exc.elapsed}s "
+            "into the consult, so it was stopped. It may be waiting on a "
+            f"sign-in or first-run prompt (run `{spec.command}` in a terminal "
+            "once) or on a network stall. The user can raise "
+            "ADVISOR_IDLE_TIMEOUT. Do NOT retry in a loop; tell the user."
+        ) from None
+    except subprocess.TimeoutExpired:
+        raise AdvisorError(
+            f"{who} was still running after {timeout_s}s and was stopped "
+            "(ADVISOR_TIMEOUT_MAX caps a consult). Ask a narrower question or "
+            "lower the answer budget.") from None
+    except OSError as exc:
+        raise AdvisorError(f"could not start {path}: {exc}") from None
+
+    outcome = reader.outcome(result.returncode, result.stderr or "")
+    found = dict(outcome.usage)
+    cost = found.pop("cost_usd", None)
+    if found:
+        _note_usage(**found)
+        if cost is None:
+            cost = _spec_cost(spec, found.get("input_tokens", 0),
+                              found.get("output_tokens", 0),
+                              found.get("cache_read_tokens", 0))
+            _note_usage(cost_usd=cost,
+                        cost_source="estimate" if cost is not None else None)
+        else:
+            _note_usage(cost_usd=round(cost, 6), cost_source="cli")
+    if outcome.error:
+        detail = outcome.error.strip()[:500]
+        if cli_advisors.looks_like_auth(detail):
+            raise AdvisorError(
+                f"AUTH FAILURE on {who}: the CLI is not signed in, or its key "
+                f"was rejected. The user must sign in to it themselves: "
+                f"{preset.setup}. Do not retry until then. CLI said: {detail}")
+        raise AdvisorError(f"{who} failed: {detail}. Do not retry it in a "
+                           "loop; tell the user if it persists.")
+    answer = _THINK_BLOCK.sub("", outcome.answer, count=1).strip()
+    if not answer:
+        raise AdvisorError(f"{who} finished without an answer. stderr: "
+                           + (result.stderr or "").strip()[-400:])
     return answer
 
 
@@ -2137,7 +2244,8 @@ def _balance_lines() -> list:
 def _connect_advisor(name: str, provider: str, api_key: str = "",
                      model: str = "", base_url: str = "",
                      allowance_tokens: int = 0, allowance_window: str = "",
-                     notes: str = "", make_default: bool = False) -> str:
+                     notes: str = "", make_default: bool = False,
+                     command: str = "") -> str:
     key = str(name or "").strip().lower()
     if key == advisors.CLAUDE:
         raise AdvisorInputError(
@@ -2148,14 +2256,15 @@ def _connect_advisor(name: str, provider: str, api_key: str = "",
             f"advisor names are 1-32 lowercase letters, digits, - or _; got "
             f"{name!r}. Try e.g. 'chatgpt', 'gemini' or 'local'.")
     provider = str(provider or "").strip().lower()
-    if provider not in advisors.PROVIDERS:
+    if provider not in advisors.ALL_PROVIDERS:
         raise AdvisorInputError(
             f"unknown provider {provider!r}; use one of "
-            f"{', '.join(advisors.PROVIDERS)}.")
+            f"{', '.join(advisors.ALL_PROVIDERS)}.")
     entry = {"provider": provider}
     for field_name, value in (("api_key", api_key), ("model", model),
                               ("base_url", base_url), ("notes", notes),
-                              ("allowance_window", allowance_window)):
+                              ("allowance_window", allowance_window),
+                              ("command", command)):
         if str(value or "").strip():
             entry[field_name] = str(value).strip()
     if allowance_tokens:
@@ -2164,6 +2273,9 @@ def _connect_advisor(name: str, provider: str, api_key: str = "",
     spec = advisors.build(key, entry, problems.append, "stored")
     if spec is None or problems:
         raise AdvisorInputError("; ".join(problems) or "invalid advisor")
+
+    if spec.kind == "cli":
+        return _save_advisor(key, entry, make_default, spec, _connect_cli(spec))
 
     model_id = advisors.model_for(spec, "")
     token = _advisor_key(spec)
@@ -2197,6 +2309,27 @@ def _connect_advisor(name: str, provider: str, api_key: str = "",
         check = (f"Could not reach {spec.base_url} right now ({exc}); saved "
                  "anyway. Start the server before consulting this advisor.")
 
+    return _save_advisor(key, entry, make_default, spec, (
+        f"model {model_id}, endpoint {spec.base_url}, key "
+        + ("stored in an owner-only file" if api_key else
+           f"read from {spec.api_key_env}" if token else "none needed")
+        + f". {check}"))
+
+
+def _connect_cli(spec: advisors.AdvisorSpec) -> str:
+    """What advisor_connect says about a CLI advisor. Runs nothing."""
+    path = _cli_path(spec)
+    model = advisors.model_for(spec, "") or "the CLI's own default"
+    if path:
+        return (f"model {model}; runs your own install at {path}, with its own "
+                "sign-in -- this server never signs in to it.")
+    preset = cli_advisors.PRESETS[spec.provider]
+    return (f"model {model}. {spec.command} is not on PATH yet; saved anyway. "
+            f"Before consulting it, {preset.setup}.")
+
+
+def _save_advisor(key: str, entry: dict, make_default: bool, spec,
+                  details: str) -> str:
     def save(store: dict) -> None:
         store.setdefault("advisors", {})[key] = entry
         if make_default:
@@ -2208,11 +2341,7 @@ def _connect_advisor(name: str, provider: str, api_key: str = "",
     _load_advisors()
     shadowed = _ADVISORS[key].source != "stored"
     return (
-        f"Connected advisor {key!r} ({spec.label}): model {model_id}, endpoint "
-        f"{spec.base_url}, key "
-        + ("stored in an owner-only file" if api_key else
-           f"read from {spec.api_key_env}" if token else "none needed")
-        + f". {check}\n"
+        f"Connected advisor {key!r} ({spec.label}): {details}\n"
         + (f"WARNING: an advisor named {key!r} is also defined in the "
            "environment or config file, and that definition wins.\n"
            if shadowed else "")
@@ -2269,6 +2398,7 @@ def _multi(question: str = "", context: str = "", attempts_so_far: str = "",
     names, readiness, a question for each, and every account's balance. After
     that one advisor failing costs only its own section.
     """
+    _refuse_if_nested()
     limit = _advisors_mod.MAX_PER_CALL
     targeted: dict = {}
     for raw, text in (targeted_questions or {}).items():
@@ -2908,8 +3038,8 @@ async def advisor_connect(name: str, provider: str, api_key: str = "",
                           model: str = "", base_url: str = "",
                           allowance_tokens: int = 0,
                           allowance_window: str = "", notes: str = "",
-                          make_default: bool = False) -> str:
-    """Connect an advisor besides Claude: ChatGPT, Gemini, OpenRouter or a local model.
+                          make_default: bool = False, command: str = "") -> str:
+    """Connect an advisor besides Claude: an API (ChatGPT, Gemini, OpenRouter, a local model) or a CLI the user installed (Codex, Antigravity, Kilo...).
 
     FREE -- makes no model call; it only lists the endpoint's models to check
     the key and the address. Call it when the user asks to add an advisor.
@@ -2922,8 +3052,12 @@ async def advisor_connect(name: str, provider: str, api_key: str = "",
 
     Args:
         name: What to call it, e.g. "chatgpt", "gemini", "local".
-        provider: "openai" (ChatGPT), "gemini", "openrouter", "lmstudio",
-            "ollama", or "openai-compatible" (any other endpoint).
+        provider: An API: "openai" (ChatGPT), "gemini", "openrouter",
+            "lmstudio", "ollama", or "openai-compatible" (any other endpoint).
+            Or a CLI the user installed and signed in to: "codex",
+            "antigravity" (Google's agy), "gemini-cli", "kilo", "opencode",
+            "qwen", "copilot", or "cli" (any tool that reads the prompt on
+            stdin and prints its answer; set command).
         api_key: The provider's API key. Not needed for local servers, or
             when the key is already in the env (OPENAI_API_KEY,
             GEMINI_API_KEY, OPENROUTER_API_KEY).
@@ -2938,12 +3072,14 @@ async def advisor_connect(name: str, provider: str, api_key: str = "",
             "week" or "month".
         notes: What this advisor is good at, shown in advisor_status.
         make_default: Send plain consults to this advisor instead of Claude.
+        command: A CLI advisor's executable, when it is not on PATH under its
+            usual name.
     """
     return await asyncio.to_thread(
         _connect_advisor, name, provider, api_key=api_key, model=model,
         base_url=base_url, allowance_tokens=allowance_tokens,
         allowance_window=allowance_window, notes=notes,
-        make_default=make_default)
+        make_default=make_default, command=command)
 
 
 @tool(title="Disconnect an advisor", annotations=CREDENTIAL_ANNOTATIONS)
@@ -3134,6 +3270,9 @@ def _advisor_status_lines() -> list:
             ready.append(name)
         if spec.kind == "claude":
             desc = f"Claude via the {_active_backend()} backend"
+        elif spec.kind == "cli":
+            desc = (f"{spec.label}, your own install ({spec.command}), model "
+                    f"{_advisor_model(spec) or 'its default'}")
         else:
             desc = (f"{spec.label}, model {_advisor_model(spec)}, "
                     f"{spec.base_url}, bills {spec.billing or 'its endpoint'}")

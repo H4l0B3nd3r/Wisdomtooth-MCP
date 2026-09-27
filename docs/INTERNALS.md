@@ -115,6 +115,24 @@ test fail, read the test's docstring before changing the test.
 - **Gemini goes through the AI Studio API.** The Gemini CLI's personal login
   rejects third-party clients.
 
+## CLI advisors
+
+- **Every vendor CLI gets its prompt on stdin**, for the same reasons as
+  Claude's. Each has its own way: `codex exec -`; `gemini`/`qwen` read stdin
+  and append `-p`; `kilo run` and `copilot` read piped stdin; `agy` only via
+  `--input-format stream-json` with `{"event": "user", "message":
+  {"content": ...}}` and `--print=`.
+- **Read-only is each CLI's own mode**, so it is weaker than Claude's
+  `--tools ""`: plan or ask modes, a read-only sandbox, denied tools. Qwen's
+  read tools are excluded one by one. Never add an auto-approve flag.
+- **Qwen reports some failures as a successful result** whose text starts
+  `[API Error`; the reader treats that as an error.
+- **`WISDOMTOOTH_NESTED`**: every CLI child (Claude included) runs with it,
+  and a server that starts with it refuses to consult. Kilo, Qwen and others
+  load the user's MCP servers, this one included.
+- `tests/fake_cli.py` speaks each CLI's output format as probed; when a CLI
+  changes its format, update the fake and the reader together.
+
 ## Testing
 
 - The suite needs no credentials and spends nothing. `tests/conftest.py`

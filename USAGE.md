@@ -269,6 +269,7 @@ endpoint and saves the advisor. The advisor works at once, with no restart.
 | `gemini` | a Gemini API key from Google AI Studio. The Gemini CLI's free Google-account login no longer works for third-party clients |
 | `openrouter` | an OpenRouter key; its credit balance is shown in `advisor_status` |
 | `lmstudio` / `ollama` | the local server running with a model loaded. Check the port: LM Studio can run on a port other than 1234 |
+| `codex`, `antigravity`, `kilo`, `opencode`, `qwen`, `copilot`, `gemini-cli` | that CLI installed and signed in by you. The advisor runs your own install in its read-only mode; nothing else to configure |
 
 Your agent can then:
 

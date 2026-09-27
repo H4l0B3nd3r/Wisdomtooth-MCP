@@ -27,7 +27,7 @@ import re
 from dataclasses import dataclass, field, replace
 from typing import Callable, Mapping, Optional
 
-from . import storage
+from . import cli_advisors, storage
 
 CLAUDE = "claude"
 # The most advisors one multi_advisor call may consult.
@@ -82,10 +82,15 @@ PROVIDERS = {
 }
 
 
+# Every provider name an advisor entry may use: HTTP endpoints above, and the
+# vendor CLIs in cli_advisors.
+ALL_PROVIDERS = tuple(PROVIDERS) + tuple(cli_advisors.PRESETS)
+
+
 @dataclass(frozen=True)
 class AdvisorSpec:
     name: str
-    kind: str                      # "claude" or "openai"
+    kind: str                      # "claude", "openai" or "cli"
     provider: str = "anthropic"
     label: str = "Claude"
     base_url: str = ""
@@ -106,6 +111,8 @@ class AdvisorSpec:
     allowance_window: str = ""
     notes: str = ""
     source: str = ""               # "env", "config" or "stored"
+    command: str = ""              # a CLI advisor's executable
+    args: tuple = ()               # extra arguments the operator added
 
     @property
     def allowance_seconds(self) -> int:
@@ -175,9 +182,11 @@ def build(name: str, raw, warn: Callable[[str], None],
         return claude_spec(source=source, **_allowance(raw, warn, where))
 
     provider = str(raw.get("provider") or "").lower()
+    if provider in cli_advisors.PRESETS:
+        return _build_cli(key, provider, raw, warn, where, source)
     if provider not in PROVIDERS:
         warn(f"{where}: unknown provider {provider or '(none)'!r}; use one of "
-             f"{', '.join(PROVIDERS)}. Skipping it")
+             f"{', '.join(ALL_PROVIDERS)}. Skipping it")
         return None
     preset = dict(PROVIDERS[provider])
     tiers = dict(preset.pop("tiers", {}))
@@ -213,6 +222,33 @@ def build(name: str, raw, warn: Callable[[str], None],
         billing=str(raw.get("billing") or preset.get("billing") or ""),
         source=source,
     )
+    return replace(spec, **_allowance(raw, warn, where))
+
+
+def _build_cli(key, provider, raw, warn, where, source) -> Optional[AdvisorSpec]:
+    """An advisor that runs a vendor CLI the user installed."""
+    preset = cli_advisors.PRESETS[provider]
+    command = str(raw.get("command") or preset.binary).strip()
+    if not command:
+        warn(f"{where}: provider 'cli' needs `command`, the executable to run; "
+             "skipping it")
+        return None
+    args = raw.get("args") or ()
+    if isinstance(args, str) or not isinstance(args, (list, tuple)):
+        warn(f"{where}: `args` must be a list of strings; ignoring it")
+        args = ()
+    tiers = dict(preset.tiers)
+    if isinstance(raw.get("tiers"), Mapping):
+        tiers.update({str(k).lower(): str(v) for k, v in raw["tiers"].items()})
+    spec = AdvisorSpec(
+        name=key, kind="cli", provider=provider,
+        label=str(raw.get("label") or preset.label),
+        command=command, args=tuple(str(a) for a in args),
+        model=str(raw.get("model") or ""), tiers=tiers,
+        efforts=tuple(preset.efforts),
+        prices=_prices(raw.get("prices"), warn, where),
+        billing=str(raw.get("billing") or preset.billing),
+        source=source)
     return replace(spec, **_allowance(raw, warn, where))
 
 

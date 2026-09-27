@@ -41,7 +41,7 @@ troubleshooting. This file is the reference.
 | `review_code(code, concern, [model, effort, max_tokens, context_files, advisor, confirm_over_limit])` | Residual doubt about subtle or security-sensitive code just written |
 | `compare_approaches(problem, options, criteria, [model, effort, max_tokens, advisor, confirm_over_limit])` | 2+ viable approaches, tradeoffs unclear after your own analysis. **One** advisor weighs the options |
 | `multi_advisor([question, context, attempts_so_far, advisors, targeted_questions, model, effort, context_files, confirm_over_limit])` | **2 or 3 advisors in parallel**: the same question to each (`advisors`), or its own question to each (`targeted_questions`) |
-| `advisor_connect(name, provider, [api_key, model, base_url, allowance_tokens, allowance_window, notes, make_default])` | Free. Connects ChatGPT, Gemini, OpenRouter or a local model, checks the key against the endpoint, and saves it — no restart |
+| `advisor_connect(name, provider, [api_key, model, base_url, allowance_tokens, allowance_window, notes, make_default])` | Free. Connects ChatGPT, Gemini, OpenRouter, a local model, or a CLI you installed (Codex, Antigravity, Kilo, Copilot...), checks what it can, and saves it — no restart |
 | `advisor_disconnect(name)` | Free. Forgets an advisor added with `advisor_connect`, and its key |
 | `advisor_login(force, wait_seconds)` | Free. **Connects the user's Claude subscription over OAuth** — opens the sign-in on their desktop, waits, and switches billing over with no restart |
 | `advisor_set_token(token)` | Free. Headless alternative: stores a `claude setup-token` credential privately and applies it immediately |
@@ -157,7 +157,39 @@ variable, the model tiers and what that provider accepts:
 | `openai-compatible` | set `base_url` | optional | none — set `model` |
 
 The model IDs are the ones the providers documented in September 2026; they
-drift, so `model` and `tiers` override them per advisor.
+drift, so `model` and `tiers` override them per advisor. When a provider
+answers "model not found", the error lists the models the endpoint offers.
+
+**CLI advisors.** An advisor can also be another vendor's coding-agent CLI,
+installed and signed in by the user. The server runs that install headless,
+with whatever sign-in or key the user gave it, and never signs in to anything
+itself:
+
+| Provider | Runs | Read-only mode used | Sign-in (done by the user) |
+|---|---|---|---|
+| `codex` | `codex exec` (OpenAI) | `--sandbox read-only` | `codex` once (ChatGPT plan or API key) |
+| `antigravity` | `agy` (Google) | `--sandbox`, no auto-approval | `agy` once |
+| `gemini-cli` | `gemini` (Google) | `--approval-mode plan` | `GEMINI_API_KEY` (Google no longer accepts the personal login here) |
+| `kilo` | `kilo run` | the `ask` agent | `kilo auth login` |
+| `opencode` | `opencode run` | the `plan` agent | `opencode auth login` |
+| `qwen` | `qwen` (Qwen Code) | `--approval-mode plan`, read tools excluded | `qwen auth` |
+| `copilot` | `copilot` (GitHub) | shell and write tools denied | `copilot login` |
+| `cli` | any `command` you name | whatever its `args` say | its own |
+
+Each consult sends the prompt on stdin, runs in an empty folder, reads the
+CLI's streamed output (so a stalled CLI is stopped by the idle limit), and
+records the tokens the CLI reports. MCP servers the CLI loads cannot loop back:
+a Wisdomtooth server started under an advisor CLI refuses to consult. These
+CLIs are agents, and their read-only modes are theirs, not this server's: the
+Claude backend switches tools off entirely, while a CLI advisor may still read
+files if its read-only mode allows it.
+
+```json
+{"advisors": {"codex": {"provider": "codex"},
+              "agy":   {"provider": "antigravity"},
+              "mine":  {"provider": "cli", "command": "/opt/bin/my-agent",
+                        "args": ["--print"]}}}
+```
 
 **Connecting one.** The user asks the agent, and the agent calls
 `advisor_connect`:

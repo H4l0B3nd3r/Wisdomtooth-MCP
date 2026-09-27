@@ -67,8 +67,9 @@ user rather than looping.
 ## Several advisors
 
 Claude is the default advisor. The user may have connected others (ChatGPT,
-Gemini, a local model...); `advisor_status` lists them, what each is good for
-(`notes`), and whether each is ready.
+Gemini, a local model, or a coding-agent CLI such as Codex or Antigravity);
+`advisor_status` lists them, what each is good for (`notes`), and whether
+each is ready.
 
 - To ask one of them, pass `advisor=<name>` to `ask_wisdomtooth`,
   `review_code` or `compare_approaches`.

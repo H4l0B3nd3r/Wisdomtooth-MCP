@@ -5,6 +5,20 @@ All notable changes to this project are listed here. The format follows
 [semantic versioning](https://semver.org/) (pre-1.0: a minor version may
 change behaviour).
 
+## [0.12.0] - 2026-09-27
+
+### Added
+- CLI advisors: another vendor's coding-agent CLI, installed and signed in by
+  the user, as an advisor. Presets for Codex (`codex`), Antigravity
+  (`antigravity`), Gemini CLI (`gemini-cli`), Kilo (`kilo`), OpenCode
+  (`opencode`), Qwen Code (`qwen`) and GitHub Copilot (`copilot`), plus `cli`
+  for any tool that reads the prompt on stdin. Each runs in its read-only
+  mode, in an empty folder, with the prompt on stdin; token usage is recorded
+  where the CLI reports it. `advisor_connect` takes these providers and a
+  `command`.
+- A Wisdomtooth server started by an advisor's CLI (which loads the user's MCP
+  servers) refuses to consult, so an advisor cannot loop back into itself.
+
 ## [0.11.2] - 2026-09-27
 
 ### Fixed
@@ -178,6 +192,7 @@ change behaviour).
   cap, UTF-8 subprocess I/O on Windows, `--strict-mcp-config` isolation, and
   process-tree cleanup on timeout.
 
+[0.12.0]: https://github.com/H4l0B3nd3r/Wisdomtooth-MCP/compare/v0.11.2...v0.12.0
 [0.11.2]: https://github.com/H4l0B3nd3r/Wisdomtooth-MCP/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/H4l0B3nd3r/Wisdomtooth-MCP/compare/19104c6...v0.11.1
 [0.11.0]: https://github.com/H4l0B3nd3r/Wisdomtooth-MCP/commit/19104c6

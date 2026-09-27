@@ -259,17 +259,21 @@ class StreamState:
 
 
 def run_streaming(cmd, env=None, workdir=None, timeout_s=60, stdin_text="",
-                  idle_s=0):
-    """Run a `stream-json` CLI, killing it on silence as well as on the clock.
+                  idle_s=0, state=None):
+    """Run a streaming CLI, killing it on silence as well as on the clock.
 
     Each output line restarts the idle clock, so an answer that takes most of
     an hour but keeps streaming runs to completion, while a CLI that has
     stopped talking is killed after `idle_s` seconds (0 = no idle limit).
-    Returns a CompletedProcess whose stdout is the final `result` object.
+
+    `state` reads the lines: by default a `StreamState` for Claude Code's
+    `stream-json`, whose `stdout()` -- the final `result` object -- becomes
+    the CompletedProcess's stdout. Any object with `feed`, `note` and
+    `stdout` works, which is how other vendors' CLIs share this runner.
     """
     proc = _popen(cmd, env, workdir)
     holder = CANCELLATION.get()
-    state = StreamState()
+    state = state if state is not None else StreamState()
     if holder is not None:
         holder.stream = state
     lines: "queue.Queue[Optional[str]]" = queue.Queue()
