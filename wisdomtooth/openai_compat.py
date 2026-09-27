@@ -80,13 +80,21 @@ class StreamState:
         return self.phase
 
     def close(self) -> None:
-        """Unblock a read in progress: shut the socket, then close."""
+        """Unblock a read in progress by shutting the socket down.
+
+        Called from another thread than the one reading. The response itself
+        is left for the reading thread to close: closing it here races that
+        thread's `readline`, which on Linux then fails inside http.client
+        with an AttributeError instead of returning. Only when there is no
+        socket to shut down is the response closed from here.
+        """
         resp = self.response
         if resp is None:
             return
         try:
             sock = resp.fp.raw._sock  # http.client's socket, behind SocketIO
             sock.shutdown(socket.SHUT_RDWR)
+            return
         except Exception:
             pass
         try:
@@ -210,7 +218,9 @@ def chat(url: str, key: str, body: dict, timeout_s: float, idle_s: float = 0,
         if holder is not None and holder.cancelled:
             raise Cancelled() from exc
         raise Silent(read_timeout, round(time.monotonic() - started)) from exc
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, AttributeError) as exc:
+        # A socket shut down under a read surfaces as any of these, depending
+        # on the platform and where http.client was when it happened.
         if holder is not None and holder.cancelled:
             raise Cancelled() from exc
         raise
