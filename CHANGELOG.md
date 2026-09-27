@@ -27,6 +27,16 @@ The first public release.
 - A Docker image, `ghcr.io/h4l0b3nd3r/wisdomtooth-mcp`, published with each
   release.
 
+## [0.12.1] - 2026-09-27
+
+### Fixed
+- On Linux and macOS, cancelling a consult to an HTTP advisor (ChatGPT,
+  Gemini, OpenRouter, a local model) raised an AttributeError instead of
+  stopping cleanly: the cancelling thread closed the response while the
+  consult thread was still reading it. It now only shuts the socket down,
+  which wakes the read, and the reading thread closes the response. This
+  failed the CI test job on Linux since 0.11.0.
+
 ## [0.12.0] - 2026-09-27
 
 ### Added
@@ -214,7 +224,8 @@ The first public release.
   cap, UTF-8 subprocess I/O on Windows, `--strict-mcp-config` isolation, and
   process-tree cleanup on timeout.
 
-[0.13.0]: https://github.com/H4l0B3nd3r/Wisdomtooth-MCP/compare/v0.12.0...v0.13.0
+[0.13.0]: https://github.com/H4l0B3nd3r/Wisdomtooth-MCP/compare/v0.12.1...v0.13.0
+[0.12.1]: https://github.com/H4l0B3nd3r/Wisdomtooth-MCP/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/H4l0B3nd3r/Wisdomtooth-MCP/compare/v0.11.2...v0.12.0
 [0.11.2]: https://github.com/H4l0B3nd3r/Wisdomtooth-MCP/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/H4l0B3nd3r/Wisdomtooth-MCP/compare/19104c6...v0.11.1
