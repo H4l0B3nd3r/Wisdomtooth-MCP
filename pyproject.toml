@@ -1,20 +1,36 @@
 [project]
 name = "wisdomtooth-mcp"
-version = "0.11.0"
+version = "0.11.1"
 description = "MCP server that lets coding agents escalate to frontier models for advice when stuck: Claude by default, plus ChatGPT, Gemini or local models, one at a time or several at once"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development",
+]
 keywords = ["mcp", "model-context-protocol", "claude", "chatgpt", "gemini", "coding-agent", "local-llm", "kilo-code"]
 # Pins reflect the APIs this server actually uses:
 #   anthropic>=0.72  -> output_config.effort, thinking={"type":"adaptive"}
 #   mcp>=1.12        -> FastMCP tool(title=..., annotations=ToolAnnotations(...))
-dependencies = ["mcp>=1.12", "anthropic>=0.72"]
+# Upper bounds at the next major: both SDKs have broken this server's imports
+# across majors before, and a `uv tool install` should never pick up one
+# untested.
+dependencies = ["mcp>=1.12,<3", "anthropic>=0.72,<2"]
 
 [project.urls]
 Repository = "https://github.com/H4l0B3nd3r/Wisdomtooth-MCP"
 Issues = "https://github.com/H4l0B3nd3r/Wisdomtooth-MCP/issues"
+Changelog = "https://github.com/H4l0B3nd3r/Wisdomtooth-MCP/blob/main/CHANGELOG.md"
 
 [project.scripts]
 wisdomtooth-mcp = "wisdomtooth.server:main"

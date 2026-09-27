@@ -4,8 +4,8 @@
 //
 //   - minimal tool surface: only ask_wisdomtooth + advisor_status are
 //     advertised. Tool schemas are charged against the local model's context
-//     on EVERY turn: ~3340 tokens with all tools, ~1090 with two. On an 8k
-//     window that is 41% vs 13%, and a shorter list also improves
+//     on EVERY turn: ~6,200 tokens with all tools, ~1,300 with two. On an 8k
+//     window that is 76% vs 16%, and a shorter list also improves
 //     tool-selection accuracy. Set ADVISOR_MINIMAL_TOOLS=0 for a session when
 //     you need the operator tools.
 //

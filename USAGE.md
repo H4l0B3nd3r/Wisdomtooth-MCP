@@ -1,8 +1,7 @@
 # Using Wisdomtooth
 
 A practical guide: what this is for, how to set it up, how to tune it, and what
-to do when it misbehaves. For the API-level reference see `README.md`; for the
-sharp edges see `GOTCHAS.md`.
+to do when it misbehaves. For the full reference see `README.md`.
 
 ---
 
@@ -35,7 +34,7 @@ quota, and would stop thinking for itself. Three mechanisms hold that line:
 ### 1. Install
 
 ```bash
-uv tool install /path/to/wisdomtooth-mcp
+uv tool install git+https://github.com/H4l0B3nd3r/Wisdomtooth-MCP
 ```
 
 You also need the Claude Code CLI on PATH — that is what talks to your
@@ -113,8 +112,8 @@ turn**, not just when it escalates. Measured on this server:
 
 | Mode | Tools | Per-turn cost | Of an 8k window |
 |---|---|---|---|
-| Full | 10 | ~3,340 tokens | 41% |
-| Minimal | 2 | ~1,090 tokens | 13% |
+| Full | 14 | ~6,200 tokens | 76% |
+| Minimal | 2 | ~1,300 tokens | 16% |
 
 Minimal mode exposes only `ask_wisdomtooth` and `advisor_status`. The operator
 tools still work — they are hidden from the model, not removed — you just turn

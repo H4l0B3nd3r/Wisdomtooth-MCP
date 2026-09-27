@@ -55,19 +55,15 @@ troubleshooting. This file is the reference.
 ## Install
 
 ```bash
-uv tool install /path/to/wisdomtooth-mcp     # recommended
-# or: pipx install /path/to/wisdomtooth-mcp
+uv tool install git+https://github.com/H4l0B3nd3r/Wisdomtooth-MCP   # recommended
+# or: pipx install git+https://github.com/H4l0B3nd3r/Wisdomtooth-MCP
 ```
 
 This puts a `wisdomtooth-mcp` command on your PATH (stdio MCP server).
+Python 3.10 or newer is required; `uv` provides one if you have none.
 
-**For subscription billing** (the default), install Claude Code:
-
-```bash
-# https://claude.com/claude-code
-```
-
-Then connect your account. The easy way is to **ask your agent to call the
+**For subscription billing** (the default), install
+[Claude Code](https://claude.com/claude-code), then connect your account. The easy way is to **ask your agent to call the
 `advisor_login` tool** — it opens the official Claude sign-in in a console
 window, waits for you to finish in the browser, and switches the advisor onto
 subscription billing straight away. No config file to edit, no server to
@@ -168,8 +164,7 @@ drift, so `model` and `tiers` override them per advisor.
 
 ```
 advisor_connect(name="gemini", provider="gemini", api_key="…")
-advisor_connect(name="local", provider="lmstudio", model="qwen/qwen3.8-27b",
-                base_url="http://localhost:8118/v1")
+advisor_connect(name="local", provider="lmstudio", model="qwen/qwen3.8-27b")
 ```
 
 It lists the endpoint's models (free — no model call), refuses a key the
@@ -359,7 +354,7 @@ Five layers, highest priority first:
 | `ADVISOR_EFFORT` | `effort` | (API default) | `low`/`medium`/`high`/`xhigh`/`max` |
 | `ADVISOR_ANSWER_BUDGET` | `answer_budget` | preset (`2000`) | Ceiling on answer length in words, presented to Claude as a ceiling, not a target. Works on **both** backends; `0` disables. The only length control the subscription backend has |
 | `ADVISOR_TRIM_ANSWERS` | `trim_answers` | `1` | When an answer runs past 1.5× the budget, the caller gets its lead and a pointer to the saved transcript, which keeps the whole answer. Needs saved consults; `0` disables |
-| `ADVISOR_MINIMAL_TOOLS` | `minimal_tools` | preset (`0`) | `1` advertises only `ask_wisdomtooth` + `advisor_status`, cutting per-turn tool context from ~3340 to ~1090 tokens |
+| `ADVISOR_MINIMAL_TOOLS` | `minimal_tools` | preset (`0`) | `1` advertises only `ask_wisdomtooth` + `advisor_status`, cutting per-turn tool context from ~6,200 to ~1,300 tokens |
 | `ADVISOR_MAX_TOKENS` | `max_tokens` | `64000` | Answer cap, **API backend only** (the CLI has no such flag), max 128000 |
 | `ADVISOR_SAVE_CONSULTS` | `save_consults` | `1` | Write every answer to a Markdown file the user can open. `0` disables |
 | `ADVISOR_CONSULT_DIR` | `consult_dir` | `~/.wisdomtooth/consults` | Where those files go |
@@ -436,19 +431,19 @@ request instead of erroring.
 
 ```bash
 uv venv && uv pip install -e . pytest pytest-asyncio anyio
-.venv/Scripts/python -m pytest        # no credentials, no spend
+.venv/Scripts/python -m pytest        # bin/ instead of Scripts/ outside Windows
 ```
 
-The suite covers request shaping against the current Messages API, the CLI
-subprocess contract (argv, stdin, environment, failure modes) against a fake
-`claude` binary, backend/billing selection, credential handling, and a real
-end-to-end MCP stdio session. It passes against mcp 1.x and 2.x, and
-anthropic 0.x and 1.x.
+The suite needs no credentials and spends nothing. It covers request shaping
+against the Messages API, the CLI subprocess contract (argv, stdin,
+environment, failure modes) against a fake `claude` binary, backend and
+billing selection, credential handling, the OpenAI-compatible client against
+a local fake endpoint, and a real MCP stdio session. CI runs it on Linux,
+Windows and macOS against both mcp 1.x and 2.x.
 
-It has also been driven end to end by a real local model (Qwen3.8-27B via
-LM Studio) using the same prompt assembly Kilo performs: the model escalated
-with `ask_wisdomtooth`, populated all three required arguments, chose its own
-model/effort tier, and received a usable in-budget answer.
+`docs/INTERNALS.md` explains the non-obvious decisions and the bugs they
+prevent; read it before changing how the CLI is run. Changes are listed in
+`CHANGELOG.md`.
 
 ## Design notes
 

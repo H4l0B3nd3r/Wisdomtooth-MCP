@@ -6,7 +6,7 @@ build/
 dist/
 
 # Virtual environments (this project keeps one per MCP SDK major, for the
-# cross-version test runs described in GOTCHAS.md)
+# cross-version test runs described in docs/INTERNALS.md)
 .venv/
 .venv-*/
 

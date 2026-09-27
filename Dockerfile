@@ -8,7 +8,10 @@ WORKDIR /app
 # and `license-files`); the build fails without them.
 COPY pyproject.toml README.md LICENSE ./
 COPY wisdomtooth ./wisdomtooth
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir . \
+    && useradd --create-home --uid 10001 wisdomtooth
+# Not root: state (~/.wisdomtooth) lives in this user's home.
+USER wisdomtooth
 # stdio by default. For a persistent server set ADVISOR_TRANSPORT=http and
 # ADVISOR_HOST=0.0.0.0 -- which also requires ADVISOR_HTTP_TOKEN: the server
 # refuses an unauthenticated bind beyond localhost.
