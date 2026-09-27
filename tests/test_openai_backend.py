@@ -340,3 +340,32 @@ def test_text_that_merely_mentions_think_tags_is_kept(server, fake_openai):
     fake_openai.answer = "Use a <think> tag only in prompts, never in output."
     srv = _srv(server, fake_openai)
     assert "<think> tag" in srv._consult(question="q", advisor="gpt")
+
+
+def test_an_unknown_model_error_lists_what_the_endpoint_offers(server,
+                                                               fake_openai):
+    """Provider model IDs go out of date; the error should name the ones that
+    exist, so the fix is one advisor_connect away."""
+    fake_openai.mode = "not_found"
+    fake_openai.models = ["fake-model-b", "fake-model-c"]
+    srv = _srv(server, fake_openai)
+    with pytest.raises(srv.AdvisorError) as exc:
+        srv._consult(question="q", advisor="gpt")
+    assert "fake-model-b" in str(exc.value)
+    assert "fake-model-c" in str(exc.value)
+
+
+def test_https_uses_the_operating_systems_trust_store(monkeypatch, tmp_path):
+    """A python.org Python on macOS ships no CA bundle, and corporate proxies
+    add their own CA to the OS store; the Anthropic SDK trusts the OS store
+    for both reasons, so the other advisors must too."""
+    import ssl
+    import truststore
+    from wisdomtooth import openai_compat
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    assert isinstance(openai_compat.ssl_context(), truststore.SSLContext)
+    monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path))  # an explicit choice wins
+    ctx = openai_compat.ssl_context()
+    assert isinstance(ctx, ssl.SSLContext)
+    assert not isinstance(ctx, truststore.SSLContext)

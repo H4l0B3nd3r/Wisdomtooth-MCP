@@ -6,6 +6,18 @@ on:
   pull_request:
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # Unused names and syntax errors only: rules that do not shift between
+      # ruff releases, so an unpinned ruff cannot break the build on its own.
+      - run: python -m pip install ruff
+      - run: ruff check --select F,E9 wisdomtooth tests
+
   test:
     name: ${{ matrix.os }} · py${{ matrix.python }} · ${{ matrix.mcp }}
     runs-on: ${{ matrix.os }}

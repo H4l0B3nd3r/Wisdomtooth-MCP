@@ -132,3 +132,52 @@ def test_auto_notices_credentials_that_appear_after_startup(
     assert srv._active_backend() == "unavailable"
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-added-later")
     assert srv._active_backend() == "api"
+
+
+# --------------------------------------------------------------------------
+# Detecting API credentials the way the Anthropic SDK finds them
+# --------------------------------------------------------------------------
+
+def test_an_empty_sdk_config_dir_is_not_a_credential(server, no_claude,
+                                                     tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_CONFIG_DIR", str(tmp_path / "anthropic"))
+    (tmp_path / "anthropic").mkdir()
+    srv = server(ADVISOR_BACKEND="auto")
+    assert srv._api_credentials_present() is False
+
+
+def test_the_active_sdk_profile_is_a_credential(server, no_claude, tmp_path,
+                                                monkeypatch):
+    base = tmp_path / "anthropic"
+    (base / "configs").mkdir(parents=True)
+    (base / "configs" / "work.json").write_text("{}", encoding="utf-8")
+    (base / "active_config").write_text("work\n", encoding="utf-8")
+    monkeypatch.setenv("ANTHROPIC_CONFIG_DIR", str(base))
+    srv = server(ADVISOR_BACKEND="auto")
+    assert srv._api_credentials_present() is True
+    assert srv._active_backend() == "api"
+
+
+def test_the_sdk_config_dir_on_windows_is_under_appdata(server, no_claude,
+                                                        tmp_path, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setattr("os.path.expanduser",
+                        lambda p: p.replace("~", str(tmp_path / "home")))
+    srv = server(ADVISOR_BACKEND="auto")
+    monkeypatch.setattr(srv.sys, "platform", "win32")
+    (tmp_path / "Anthropic" / "configs").mkdir(parents=True)
+    (tmp_path / "Anthropic" / "configs" / "default.json").write_text(
+        "{}", encoding="utf-8")
+    assert srv._api_credentials_present() is True
+
+
+def test_a_profile_name_cannot_escape_the_config_dir(server, no_claude,
+                                                     tmp_path, monkeypatch):
+    base = tmp_path / "anthropic"
+    base.mkdir()
+    (tmp_path / "evil.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("ANTHROPIC_CONFIG_DIR", str(base))
+    monkeypatch.setenv("ANTHROPIC_PROFILE", "../../evil")
+    srv = server(ADVISOR_BACKEND="auto")
+    assert srv._api_credentials_present() is False

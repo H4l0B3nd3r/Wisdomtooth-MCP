@@ -81,7 +81,9 @@ def save(directory: str, kind: str, topic: str, body: str) -> Optional[str]:
     """
     stamp = time.strftime("%Y%m%d-%H%M%S")
     try:
-        os.makedirs(directory, exist_ok=True)
+        # Owner-only: a transcript holds the code and errors that were sent,
+        # and anything redaction missed.
+        os.makedirs(directory, mode=0o700, exist_ok=True)
         # Two consults can land in the same second; "x" mode makes the loser of
         # that race take the next name rather than overwrite the winner.
         for attempt in range(1, 50):
@@ -89,11 +91,12 @@ def save(directory: str, kind: str, topic: str, body: str) -> Optional[str]:
             path = os.path.join(directory, stamp + "-" + slug(kind, 24) + "-"
                                 + slug(topic) + tail + SUFFIX)
             try:
-                with open(path, "x", encoding="utf-8") as fh:
-                    fh.write(body)
-                return path
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             except FileExistsError:
                 continue
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            return path
         return None  # pragma: no cover - 49 collisions inside one second
     except OSError as exc:
         print("[wisdomtooth] could not save the consult transcript to "

@@ -17,7 +17,6 @@ import importlib
 import json
 import os
 import shutil
-import subprocess
 import sys
 import textwrap
 from pathlib import Path
@@ -35,6 +34,11 @@ ADVISOR_ENV = tuple(sorted(set(_srv.CONFIG_KEYS.values()) | {
     "ADVISOR_KEEP_AUTH_ENV", "ADVISOR_NO_STRICT_MCP", "ADVISOR_NSFW_EXTRA_JSON",
     "ADVISOR_CONFIG",
     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+    # Where the Anthropic SDK finds a stored login; the developer's own must
+    # not make a "no credentials" test pass or fail.
+    "ANTHROPIC_CONFIG_DIR", "ANTHROPIC_PROFILE", "ANTHROPIC_FEDERATION_RULE_ID",
+    "ANTHROPIC_ORGANIZATION_ID", "ANTHROPIC_IDENTITY_TOKEN",
+    "ANTHROPIC_IDENTITY_TOKEN_FILE",
 }))
 
 
@@ -45,7 +49,8 @@ ADVISOR_ENV = tuple(sorted(set(_srv.CONFIG_KEYS.values()) | {
 # `consult_dir` fixture below, and wiping it would scatter transcripts through
 # the developer's real ~/.wisdomtooth.
 _PRESERVED = {"ADVISOR_CLAUDE_BIN", "ADVISOR_CONSULT_DIR", "ADVISOR_USAGE_FILE",
-              "ADVISOR_ADVISORS_FILE", "ADVISOR_ACCOUNTS_FILE"}
+              "ADVISOR_ADVISORS_FILE", "ADVISOR_ACCOUNTS_FILE",
+              "ANTHROPIC_CONFIG_DIR"}
 
 
 def _reload(env: dict) -> object:
@@ -85,6 +90,16 @@ def advisors_file(tmp_path, monkeypatch):
     of the developer's real store."""
     path = tmp_path / "advisors.json"
     monkeypatch.setenv("ADVISOR_ADVISORS_FILE", str(path))
+    return path
+
+
+@pytest.fixture(autouse=True)
+def sdk_config_dir(tmp_path, monkeypatch):
+    """Point the Anthropic SDK's stored-login directory at an empty temp
+    path, so the developer's own `ant auth login` never counts as API
+    credentials in a test."""
+    path = tmp_path / "anthropic-sdk"
+    monkeypatch.setenv("ANTHROPIC_CONFIG_DIR", str(path))
     return path
 
 

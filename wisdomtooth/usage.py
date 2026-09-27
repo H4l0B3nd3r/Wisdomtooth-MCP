@@ -12,6 +12,8 @@ import os
 import time
 from typing import Optional
 
+from . import storage
+
 # USD per million tokens (input, output) at first-party API rates, matched by
 # longest prefix. Used only to *estimate*: a subscription consult is not billed
 # per token, and when the CLI reports its own API-equivalent figure that wins.
@@ -135,13 +137,25 @@ def read_ledger(path: str) -> list:
 
 
 def compact_ledger(path: str) -> None:
+    """Drop records past the retention window. Hold `storage.locked(path)`."""
     cutoff = time.time() - LEDGER_KEEP_DAYS * 86400
     keep = [r for r in read_ledger(path) if float(r.get("ts", 0)) >= cutoff]
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        for record in keep:
-            fh.write(json.dumps(record, separators=(",", ":")) + "\n")
-    os.replace(tmp, path)
+    storage.write_atomic(path, "".join(
+        json.dumps(r, separators=(",", ":")) + "\n" for r in keep),
+        private=True)
+
+
+def append(path: str, record: dict) -> None:
+    """Add one record to the ledger, compacting it once it grows too large.
+
+    Under the ledger's lock: every server process on the machine appends to
+    the same file, and a compaction racing an append would drop the append.
+    """
+    with storage.locked(path):
+        storage.append_line(path, json.dumps(record, separators=(",", ":")),
+                            private=True)
+        if os.path.getsize(path) > LEDGER_MAX_BYTES:
+            compact_ledger(path)
 
 
 def billed(records: list) -> list:

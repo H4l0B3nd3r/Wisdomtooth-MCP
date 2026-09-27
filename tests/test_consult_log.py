@@ -7,9 +7,12 @@ mechanism that survives all three: a Markdown file on disk, its path quoted in
 the answer footer, and a `resource_link` block pointing at the same file.
 """
 
+import os
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+import pytest
 
 from mcp import types
 
@@ -213,3 +216,15 @@ async def test_no_resource_link_when_saving_is_off(fake_claude):
 
     assert "FAKE ANSWER" in text
     assert not [b for b in result.content if isinstance(b, types.ResourceLink)]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permissions")
+def test_transcripts_and_the_ledger_are_owner_only(server, fake_claude,
+                                                   consult_dir, usage_file):
+    """They hold what was sent: code, errors, and anything redaction missed."""
+    srv = server(ADVISOR_BACKEND="claude-code")
+    srv._consult(question="q")
+    (transcript,) = consult_dir.iterdir()
+    assert transcript.stat().st_mode & 0o777 == 0o600
+    assert consult_dir.stat().st_mode & 0o777 == 0o700
+    assert usage_file.stat().st_mode & 0o777 == 0o600

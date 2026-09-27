@@ -13,7 +13,9 @@ billed, to the end.
 """
 
 import json
+import os
 import socket
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -133,9 +135,29 @@ def _headers(key: str) -> dict:
     return headers
 
 
+def ssl_context() -> ssl.SSLContext:
+    """Certificate verification the way the Anthropic SDK does it.
+
+    SSL_CERT_FILE or SSL_CERT_DIR when set, otherwise the operating system's
+    own trust store through `truststore`. Python's default store is empty on a
+    python.org install on macOS, and lacks the CA a corporate proxy adds to
+    the system store.
+    """
+    if os.environ.get("SSL_CERT_FILE"):
+        return ssl.create_default_context(cafile=os.environ["SSL_CERT_FILE"])
+    if os.environ.get("SSL_CERT_DIR"):
+        return ssl.create_default_context(capath=os.environ["SSL_CERT_DIR"])
+    try:
+        import truststore
+    except ImportError:  # pragma: no cover - a dependency; defensive only
+        return ssl.create_default_context()
+    return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+
 def _open(req, timeout):
     try:
-        return urllib.request.urlopen(req, timeout=timeout)
+        return urllib.request.urlopen(req, timeout=timeout,
+                                      context=ssl_context())
     except urllib.error.HTTPError as exc:
         message, code = _error_message(exc.read())
         raise HTTPFailure(exc.code, message or exc.reason, _kept(exc.headers),

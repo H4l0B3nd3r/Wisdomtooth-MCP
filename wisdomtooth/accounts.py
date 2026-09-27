@@ -17,11 +17,14 @@ The last reading per advisor is kept in a small JSON file, so a restarted
 server still knows where the plan stood.
 """
 
+import contextlib
 import json
 import os
 import threading
 import time
 from typing import Callable, Optional
+
+from . import storage
 
 # unifiedWindows keys -> the labels used everywhere else.
 PLAN_WINDOWS = (("five_hour", "5 h"), ("seven_day", "7 d"))
@@ -32,44 +35,63 @@ CREDIT_MAX_AGE_S = 60
 
 
 class Meter:
+    """The readings, shared through one file by every server process."""
+
     def __init__(self, path: Callable[[], str]):
         self._path = path
         self._lock = threading.Lock()
         self._data: Optional[dict] = None
+        self._stamp = None
 
     # -- storage -----------------------------------------------------------
 
+    def _file_stamp(self):
+        try:
+            info = os.stat(self._path())
+            return info.st_mtime_ns, info.st_size
+        except OSError:
+            return None
+
     def _load(self) -> dict:
-        if self._data is None:
+        """The readings, re-read whenever another process has written."""
+        stamp = self._file_stamp()
+        if self._data is None or stamp != self._stamp:
             try:
                 with open(self._path(), encoding="utf-8") as fh:
                     data = json.load(fh)
                 self._data = data if isinstance(data, dict) else {}
             except (OSError, ValueError):
                 self._data = {}
+            self._stamp = stamp
         return self._data
 
-    def _save(self) -> None:
-        path = self._path()
-        try:
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(self._data, fh, separators=(",", ":"))
-            os.replace(tmp, path)
-        except OSError:
-            pass  # monitoring must never cost the user an answer
+    @contextlib.contextmanager
+    def _update(self, advisor: str):
+        """Yield `advisor`'s entry, fresh from disk, and write it back.
 
-    def _entry(self, advisor: str) -> dict:
-        return self._load().setdefault(advisor, {})
+        Under the file's lock, so two processes recording at once both land.
+        Monitoring must never cost the user an answer, so I/O errors are
+        swallowed.
+        """
+        with self._lock, contextlib.ExitStack() as stack:
+            try:
+                stack.enter_context(storage.locked(self._path()))
+            except OSError:
+                yield {}  # nowhere to keep the reading
+                return
+            self._data = None
+            yield self._load().setdefault(advisor, {})
+            with contextlib.suppress(OSError):
+                storage.write_atomic(self._path(), json.dumps(
+                    self._data, separators=(",", ":")))
+                self._stamp = self._file_stamp()
 
     # -- recording ---------------------------------------------------------
 
     def note_plan(self, advisor: str, info: dict, cost_usd) -> None:
         """Record a `rate_limit_info` and learn from how far it moved."""
         now = time.time()
-        with self._lock:
-            entry = self._entry(advisor)
+        with self._update(advisor) as entry:
             windows = info.get("unifiedWindows")
             windows = windows if isinstance(windows, dict) else {}
             last = entry.setdefault("last", {})
@@ -94,7 +116,6 @@ class Meter:
             entry["plan"] = {"status": info.get("status"),
                              "overage": info.get("isUsingOverage"),
                              "seen": now}
-            self._save()
 
     def note_headers(self, advisor: str, headers: dict) -> None:
         def number(name):
@@ -106,22 +127,20 @@ class Meter:
         left = number("x-ratelimit-remaining-tokens")
         if limit is None and left is None:
             return
-        with self._lock:
-            self._entry(advisor)["ratelimit"] = {
+        with self._update(advisor) as entry:
+            entry["ratelimit"] = {
                 "limit": limit, "remaining": left,
                 "reset": headers.get("x-ratelimit-reset-tokens"),
                 "seen": time.time()}
-            self._save()
 
     def note_credit(self, advisor: str, data: dict) -> None:
         def number(name):
             value = data.get(name)
             return float(value) if isinstance(value, (int, float)) else None
-        with self._lock:
-            self._entry(advisor)["credit"] = {
+        with self._update(advisor) as entry:
+            entry["credit"] = {
                 "limit": number("limit"), "remaining": number("limit_remaining"),
                 "usage": number("usage"), "seen": time.time()}
-            self._save()
 
     # -- reading -----------------------------------------------------------
 

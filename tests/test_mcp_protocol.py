@@ -9,7 +9,6 @@ import os
 import sys
 from pathlib import Path
 
-import pytest
 from contextlib import asynccontextmanager
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client

@@ -5,6 +5,29 @@ All notable changes to this project are listed here. The format follows
 [semantic versioning](https://semver.org/) (pre-1.0: a minor version may
 change behaviour).
 
+## [0.11.2] - 2026-09-27
+
+### Fixed
+- Several server processes (one per client session) no longer lose each
+  other's writes: the usage ledger, the account meter, the advisor store and
+  the stored token are updated under a cross-process lock and replaced
+  atomically.
+- API credentials are detected the way the Anthropic SDK finds them:
+  `ANTHROPIC_CONFIG_DIR`, `%APPDATA%\Anthropic` on Windows, the active
+  profile, and workload identity. An empty `~/.config/anthropic` folder no
+  longer counts.
+- HTTPS to other advisors verifies against the operating system's trust
+  store (as the Anthropic SDK does), so a python.org Python on macOS and
+  corporate proxy CAs work. `SSL_CERT_FILE` / `SSL_CERT_DIR` still win.
+- A "model not found" error from another advisor lists the models the
+  endpoint offers.
+
+### Changed
+- Transcripts, the usage ledger and the stored token are owner-only files on
+  macOS and Linux, in an owner-only folder.
+- New dependency: `truststore`. CI also runs `ruff` for unused names and
+  syntax errors.
+
 ## [0.11.1] - 2026-09-27
 
 ### Security
@@ -155,6 +178,7 @@ change behaviour).
   cap, UTF-8 subprocess I/O on Windows, `--strict-mcp-config` isolation, and
   process-tree cleanup on timeout.
 
+[0.11.2]: https://github.com/H4l0B3nd3r/Wisdomtooth-MCP/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/H4l0B3nd3r/Wisdomtooth-MCP/compare/19104c6...v0.11.1
 [0.11.0]: https://github.com/H4l0B3nd3r/Wisdomtooth-MCP/commit/19104c6
 [0.10.0]: https://github.com/H4l0B3nd3r/Wisdomtooth-MCP/commit/ed60c06

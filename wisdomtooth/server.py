@@ -70,7 +70,7 @@ except ImportError:  # mcp 1.x
 from mcp.types import ToolAnnotations
 
 from . import (accounts, advisors, claude_cli, config, doctor, httpauth, models,
-               openai_compat, prompts, safety, transcripts, usage)
+               openai_compat, prompts, safety, storage, transcripts, usage)
 from .backends import Backend
 from .claude_cli import CANCELLATION as _CANCELLATION
 from .claude_cli import Cancellation as _Cancellation
@@ -360,12 +360,45 @@ def client() -> Anthropic:
 
 
 def _api_credentials_present() -> bool:
-    if os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+    """Whether the Anthropic SDK will find credentials, checked the way it
+    looks: environment variables, workload identity, then the active profile
+    that `ant auth login` stores."""
+    env = os.environ
+    if env.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN"):
         return True
-    # `ant auth login` stores an OAuth profile the SDK picks up with no env var
-    # set, so an unset ANTHROPIC_API_KEY does not mean "no credentials".
-    return os.path.isdir(os.path.join(os.path.expanduser("~"), ".config",
-                                      "anthropic"))
+    if (env.get("ANTHROPIC_FEDERATION_RULE_ID")
+            and env.get("ANTHROPIC_ORGANIZATION_ID")
+            and (env.get("ANTHROPIC_IDENTITY_TOKEN")
+                 or env.get("ANTHROPIC_IDENTITY_TOKEN_FILE"))):
+        return True
+    return _sdk_profile_path() is not None
+
+
+def _sdk_profile_path() -> Optional[str]:
+    """The SDK's active profile config file, if it exists.
+
+    The directory is ANTHROPIC_CONFIG_DIR, else `Anthropic` under %APPDATA%
+    on Windows and ~/.config/anthropic elsewhere; the profile is
+    ANTHROPIC_PROFILE, else the `active_config` pointer, else "default".
+    """
+    base = os.environ.get("ANTHROPIC_CONFIG_DIR")
+    if not base and sys.platform == "win32":
+        base = os.path.join(os.environ.get("APPDATA") or os.path.join(
+            os.path.expanduser("~"), "AppData", "Roaming"), "Anthropic")
+    base = base or os.path.join(os.path.expanduser("~"), ".config", "anthropic")
+    profile = os.environ.get("ANTHROPIC_PROFILE")
+    if not profile:
+        try:
+            with open(os.path.join(base, "active_config"),
+                      encoding="utf-8") as fh:
+                profile = fh.read().strip()
+        except OSError:
+            profile = ""
+    profile = profile or "default"
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", profile) or ".." in profile:
+        return None
+    path = os.path.join(base, "configs", profile + ".json")
+    return path if os.path.isfile(path) else None
 
 
 # ---------------------------------------------------------------------------
@@ -411,18 +444,10 @@ def _set_oauth_token(token: str) -> str:
             "in a terminal and pass only the token it prints back.")
 
     path = _credentials_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    data = _read_credentials()
-    data["claude_code_oauth_token"] = token
-    # Create with restrictive permissions *before* writing, so the secret is
-    # never briefly world-readable.
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(data, fh)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass  # Windows has no POSIX modes; the user profile dir is the guard
+    with storage.locked(path):
+        data = _read_credentials()
+        data["claude_code_oauth_token"] = token
+        storage.write_atomic(path, json.dumps(data), private=True)
 
     _invalidate_backend()
     return (f"Subscription token saved to {path} (owner-only) and applied to "
@@ -433,13 +458,13 @@ def _set_oauth_token(token: str) -> str:
 def _clear_oauth_token() -> str:
     """Forget the stored token. Does not touch the CLI's own login state."""
     path = _credentials_path()
-    data = _read_credentials()
-    had = data.pop("claude_code_oauth_token", None)
-    if data:
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(data, fh)
-    elif os.path.isfile(path):
-        os.remove(path)
+    with storage.locked(path):
+        data = _read_credentials()
+        had = data.pop("claude_code_oauth_token", None)
+        if data:
+            storage.write_atomic(path, json.dumps(data), private=True)
+        elif os.path.isfile(path):
+            os.remove(path)
     _invalidate_backend()
     if not had:
         return ("No advisor-stored subscription token to remove. If the CLI "
@@ -720,12 +745,7 @@ def _append_usage(record: dict) -> None:
         return
     path = _usage_path()
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with _LEDGER_LOCK:
-            with open(path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record, separators=(",", ":")) + "\n")
-            if os.path.getsize(path) > usage.LEDGER_MAX_BYTES:
-                usage.compact_ledger(path)
+        usage.append(path, record)
     except OSError as exc:
         print(f"[wisdomtooth] could not write the usage ledger {path}: {exc}",
               file=sys.stderr)
@@ -1829,6 +1849,19 @@ def _consult_openai(spec: advisors.AdvisorSpec, system: str, user_content: str,
     return answer
 
 
+def _offered_models(spec: advisors.AdvisorSpec) -> list:
+    """The model IDs the endpoint lists, or [] if it cannot say. Free: no
+    model is called."""
+    try:
+        listing = openai_compat.get_json(spec.base_url + "/models",
+                                         _advisor_key(spec), timeout_s=10)
+    except Exception:  # a failed listing must not hide the original error
+        return []
+    data = listing.get("data") if isinstance(listing, dict) else None
+    return [str(m.get("id")) for m in data or [] if isinstance(m, dict)
+            and m.get("id")]
+
+
 def _openai_failure(spec, exc, model) -> AdvisorError:
     who = f"advisor {spec.name!r} ({spec.label})"
     detail = f"HTTP {exc.status}: {exc.message}"
@@ -1855,10 +1888,16 @@ def _openai_failure(spec, exc, model) -> AdvisorError:
                if wait else "")
             + " Do not retry immediately.")
     if exc.status == 404:
+        offered = _offered_models(spec)
         return AdvisorError(
             f"{who}: {detail}. Either the model {model!r} does not exist on "
             f"this endpoint or the base_url ({spec.base_url}) is wrong. "
-            "advisor_connect lists the models an endpoint offers.")
+            + (f"The endpoint offers: {', '.join(offered[:20])}"
+               + (" ..." if len(offered) > 20 else "")
+               + ". Pass one as model=, or have the user call advisor_connect "
+               f"with name={spec.name!r} and model=<id> to change the default."
+               if offered else "advisor_connect lists the models an endpoint "
+               "offers."))
     return AdvisorError(f"{who} failed ({detail}).")
 
 
@@ -2158,13 +2197,14 @@ def _connect_advisor(name: str, provider: str, api_key: str = "",
         check = (f"Could not reach {spec.base_url} right now ({exc}); saved "
                  "anyway. Start the server before consulting this advisor.")
 
-    path = _advisors_path()
-    store = advisors.read_store(path, _warn)
-    store.setdefault("advisors", {})[key] = entry
+    def save(store: dict) -> None:
+        store.setdefault("advisors", {})[key] = entry
+        if make_default:
+            store["default"] = key
+
+    advisors.update_store(_advisors_path(), save, _warn)
     if make_default:
-        store["default"] = key
         _OVERRIDES.pop("advisor", None)
-    advisors.write_store(path, store)
     _load_advisors()
     shadowed = _ADVISORS[key].source != "stored"
     return (
@@ -2183,20 +2223,21 @@ def _connect_advisor(name: str, provider: str, api_key: str = "",
 
 def _disconnect_advisor(name: str) -> str:
     key = str(name or "").strip().lower()
-    path = _advisors_path()
-    store = advisors.read_store(path, _warn)
-    stored = store.get("advisors") or {}
-    if key not in stored:
-        where = ("It is defined in ADVISOR_ADVISORS_JSON or the config file; "
-                 "remove it there." if key in _ADVISORS
-                 else f"Connected: {_advisor_choices()}.")
-        raise AdvisorInputError(f"no stored advisor named {name!r}. {where}")
-    del stored[key]
-    if store.get("default") == key:
-        store.pop("default")
+
+    def remove(store: dict) -> None:
+        stored = store.get("advisors") or {}
+        if key not in stored:
+            where = ("It is defined in ADVISOR_ADVISORS_JSON or the config "
+                     "file; remove it there." if key in _ADVISORS
+                     else f"Connected: {_advisor_choices()}.")
+            raise AdvisorInputError(f"no stored advisor named {name!r}. {where}")
+        del stored[key]
+        if store.get("default") == key:
+            store.pop("default")
+
+    advisors.update_store(_advisors_path(), remove, _warn)
     if _OVERRIDES.get("advisor") == key:
         _OVERRIDES.pop("advisor")
-    advisors.write_store(path, store)
     _load_advisors()
     return (f"Disconnected advisor {key!r} and deleted its stored settings and "
             f"key. Default advisor: {_default_advisor()}.")

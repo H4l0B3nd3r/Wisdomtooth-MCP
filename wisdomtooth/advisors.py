@@ -27,6 +27,8 @@ import re
 from dataclasses import dataclass, field, replace
 from typing import Callable, Mapping, Optional
 
+from . import storage
+
 CLAUDE = "claude"
 # The most advisors one multi_advisor call may consult.
 MAX_PER_CALL = 3
@@ -246,16 +248,18 @@ def read_store(path: str, warn) -> dict:
 
 def write_store(path: str, data: dict) -> None:
     """Owner-only from the first byte: the store holds API keys."""
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    tmp = path + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2)
-    os.replace(tmp, path)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass  # Windows has no POSIX modes; the user profile dir is the guard
+    storage.write_atomic(path, json.dumps(data, indent=2), private=True)
+
+
+def update_store(path: str, change: Callable[[dict], None], warn) -> dict:
+    """Read the store, apply `change`, and write it back, under the store's
+    lock so a concurrent change in another server process is not lost. An
+    exception from `change` leaves the file untouched."""
+    with storage.locked(path):
+        store = read_store(path, warn)
+        change(store)
+        write_store(path, store)
+    return store
 
 
 def load(env_json, file_entries, stored_entries, warn) -> dict:
