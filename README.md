@@ -33,6 +33,18 @@ because it exists, so it is enforced in three places:
 3. **A rules file.** `.kilocode/rules/wisdomtooth.md` gives the agent the full
    escalation policy as standing instructions.
 
+**It's also a reviewer, not only a lifeline.** Wisdomtooth works just as well
+as a second pair of eyes on work that is going fine. `review_code` asks an
+advisor to critique code the agent has just written, with an optional focus
+such as security, performance or async correctness. `compare_approaches` gets
+an outside opinion before the agent commits to a design, and `multi_advisor`
+collects reviews from two or three different models at once. Out of the box,
+the tool descriptions steer the agent towards reviews only when it has real
+doubts about subtle or security-sensitive code. If you want feedback more
+often, say so: ask the agent to "have Wisdomtooth review this before you
+finish", or add a line to your rules file, such as "run `review_code` on every
+non-trivial change before calling the task done".
+
 **New here?** Start with `USAGE.md`, which covers setup, tuning for local
 models and troubleshooting. This README is the reference.
 
